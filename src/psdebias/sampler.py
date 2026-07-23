@@ -368,20 +368,28 @@ def _predictive_pass(
         p = design.shape[1]
         for d in range(n_beta_draws):
             curve = design @ betas[i, d, :p]
-            # Smooth mode fitted log S(f); exponentiating EACH draw and then
-            # averaging gives the posterior mean of S(f) itself. (Averaging
-            # first and exponentiating after would instead give the posterior
-            # geometric mean — smaller by Jensen's inequality.)
-            if exponentiate:
-                curve = np.exp(curve)
+            # Smooth mode fits log S(f). Accumulate on the LOG scale and
+            # exponentiate the mean (plug-in): exp(E[log S]) = S. The mean of
+            # exp(curve) would instead be S * exp(sigma^2/2), inflated upward by
+            # Jensen's inequality — the bias the log-mean offset unmasks.
             total += curve
             total_sq += curve * curve
             if store:
-                stored[i * n_beta_draws + d] = curve
+                if exponentiate:
+                    stored[i * n_beta_draws + d] = np.exp(curve)
+                else:
+                    stored[i * n_beta_draws + d] = curve
 
-    mean = total / n_draws_total
-    var = total_sq / n_draws_total - mean * mean
-    std = np.sqrt(np.maximum(var, 0.0))
+    mu = total / n_draws_total
+    var = total_sq / n_draws_total - mu * mu
+    if exponentiate:
+        # exp of the log-scale posterior mean; map the log-scale variance to a
+        # linear-scale sd via the lognormal relation sd = mean * sqrt(e^var - 1).
+        mean = np.exp(mu)
+        std = mean * np.sqrt(np.maximum(np.exp(var) - 1.0, 0.0))
+    else:
+        mean = mu
+        std = np.sqrt(np.maximum(var, 0.0))
     return mean, std, stored
 
 
@@ -392,7 +400,16 @@ def _predictive_pass(
 @dataclass
 class FitResult:
     """Posterior summary of a PSDebias fit. ``mean``/``std``/``posterior_predictive``
-    are always linear-scale PSD (smooth-mode draws are exponentiated per draw)."""
+    are always linear-scale PSD.
+
+    In debias mode ``mean`` is the posterior mean of the (linear) spectrum. In
+    smooth mode the fit is on ``log S(f)``, and ``mean`` is the exponentiated
+    posterior mean of that log-spectrum — ``exp(E[log S])``, the plug-in point
+    estimate (a geometric mean/median), not the posterior mean of ``S`` itself.
+    Taking the arithmetic mean of the exponentiated draws would instead give
+    ``S * exp(sigma^2/2)``, inflated upward by Jensen's inequality. ``std`` is
+    the matching linear-scale sd (lognormal-mapped in smooth mode), and
+    ``posterior_predictive`` still holds the individual exponentiated draws."""
 
     freqs: npt.NDArray[np.float64]
     mean: npt.NDArray[np.float64]
