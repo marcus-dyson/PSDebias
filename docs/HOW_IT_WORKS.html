@@ -1,0 +1,1060 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN"
+	"http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+
+<html xmlns="http://www.w3.org/1999/xhtml">
+
+<head>
+<title>HOW_IT_WORKS.html</title>
+<meta http-equiv="Content-Type" content="application/xhtml+xml;charset=utf-8"/>
+<link rel="stylesheet" type="text/css" media="all" href="https://cdn.jsdelivr.net/npm/github-markdown-css/github-markdown.min.css"  />
+<link rel="stylesheet" type="text/css" media="all" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release/build/styles/github.min.css"  /><meta name='viewport' content='width=device-width, initial-scale=1, shrink-to-fit=no'><style> body { box-sizing: border-box; max-width: 740px; width: 100%; margin: 40px auto; padding: 0 10px; } </style><script id='MathJax-script' async src='https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js'></script><script src='https://cdn.jsdelivr.net/gh/highlightjs/cdn-release/build/highlight.min.js'></script><script>document.addEventListener('DOMContentLoaded', () => { document.body.classList.add('markdown-body'); document.querySelectorAll('pre[lang] > code').forEach((code) => { code.classList.add(code.parentElement.lang); }); document.querySelectorAll('pre > code').forEach((code) => { hljs.highlightBlock(code); }); });</script>
+</head>
+
+<body>
+
+<h1 id="how-psdebias-works-a-guided-tour-of-the-code">How psdebias works
+— a guided tour of the code</h1>
+<p>This document walks through the implementation for someone who knows
+the paper (<em>Adaptive Smoothing of Quadratic Spectral Estimators</em>)
+but has not read this codebase. It explains what each piece does, why it
+is built the way it is, and where the paper’s equations live in the
+source. Inline comments in the source cover the same ground at the line
+level; this is the map.</p>
+<p>Contents:</p>
+<ol type="1">
+<li><a href="#1-the-30-second-picture">The 30-second picture</a></li>
+<li><a href="#2-one-regression-two-regimes">One regression, two
+regimes</a></li>
+<li><a href="#3-building-the-bases">Building the bases</a></li>
+<li><a href="#4-the-sampler">The sampler</a></li>
+<li><a href="#5-outputs">Outputs</a></li>
+<li><a href="#6-the-regime-diagnostics">The regime diagnostics</a></li>
+<li><a href="#7-numerical-engineering-appendix">Numerical engineering
+appendix</a></li>
+<li><a
+href="#8-suggested-reading-order-and-paper-cross-reference">Suggested
+reading order and paper cross-reference</a></li>
+<li><a href="#9-where-the-tests-pin-behavior">Where the tests pin
+behavior</a></li>
+<li><a href="#10-the-bias-variance-study-scripts-and-notebook">The
+bias-variance study (scripts and notebook)</a></li>
+</ol>
+<hr />
+<h2 id="the-30-second-picture">1. The 30-second picture</h2>
+<pre><code> time series x
+      |
+      v
+ estimators.py  -&gt;  (freqs, psd, kernel)          kernel = taper autocorrelation
+      |                                            = the estimator&#39;s bias, as a sequence
+      v
+ diagnostic.sign_diagnostic  -&gt;  debias or smooth?         [fit_psd(mode=&quot;auto&quot;)]
+      |
+      v
+ sampler.PSDebias(mode=...)      builds bases ONCE   (splines.half_bases[_biased])
+      .sample()                  runs MH over knot configurations (_mh_kernel)
+      |
+      v
+ FitResult: mean, std, gammas, betas, acceptance_rate    (always linear-scale PSD)
+ PSDebias.map_estimate(): most probable single configuration</code></pre>
+<p>File map (all under <code>src/psdebias/</code>):</p>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>file</th>
+<th>one line</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>estimators.py</code></td>
+<td>periodogram / Welch / lag-window / multitaper; each also returns its
+bias <code>kernel</code></td>
+</tr>
+<tr class="even">
+<td><code>util.py</code></td>
+<td><code>psd_from_acf</code> (lag-domain -&gt; rfft-grid transform, the
+workhorse), grid helpers</td>
+</tr>
+<tr class="odd">
+<td><code>splines.py</code></td>
+<td>everything about bases: candidate knots, primitives, closed-form
+ACFs, design-matrix assembly + incremental update</td>
+</tr>
+<tr class="even">
+<td><code>sampler.py</code></td>
+<td>the Numba MH kernel, the <code>PSDebias</code> class,
+<code>fit_psd</code></td>
+</tr>
+<tr class="odd">
+<td><code>diagnostic.py</code></td>
+<td>the Sec. IV-C sign rule</td>
+</tr>
+<tr class="even">
+<td><code>dwelch.py</code></td>
+<td>fixed-mesh debiasing baselines (NNLS instead of a sampler)</td>
+</tr>
+<tr class="odd">
+<td><code>analytic.py</code>, <code>simulate.py</code></td>
+<td>closed-form spectra and process simulators for validation</td>
+</tr>
+</tbody>
+</table>
+<h2 id="one-regression-two-regimes">2. One regression, two regimes</h2>
+<p>Everything the sampler does is Bayesian variable selection on
+<strong>one</strong> linear model, <code>Y = X_gamma beta + eps</code>
+(paper Eq. 3). The two regimes differ only in what <code>Y</code> and
+<code>X</code> are — decided once, in
+<code>PSDebias.__init__</code>:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th></th>
+<th><code>mode="debias"</code></th>
+<th><code>mode="smooth"</code></th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>knots</td>
+<td><code>[0, freqs[pos], 0.5]</code> (ghosts, off-grid)</td>
+<td><code>freqs[pos]</code></td>
+</tr>
+<tr class="even">
+<td>response <code>Y</code></td>
+<td><code>ones(g)</code></td>
+<td><code>log(estimate)</code></td>
+</tr>
+<tr class="odd">
+<td>fitting bases</td>
+<td>window-convolved, scaled by <code>1/estimate</code></td>
+<td>direct B1 evaluations</td>
+</tr>
+<tr class="even">
+<td>positivity of <code>beta_hat</code></td>
+<td>required (truncated posterior)</td>
+<td>not needed (<code>exp</code> is positive)</td>
+</tr>
+<tr class="odd">
+<td>output bases</td>
+<td>unconvolved B1</td>
+<td>unconvolved B1</td>
+</tr>
+<tr class="even">
+<td>output transform</td>
+<td>none</td>
+<td><code>exp</code> per draw</td>
+</tr>
+</tbody>
+</table>
+<p>Two things worth internalizing:</p>
+<ul>
+<li><strong>Why the debias response is <code>ones</code>.</strong> The
+paper’s Eq. 5 regression is
+<code>I(w) ~ sum_i beta_i (B_i * H_n)(w)</code>. Dividing both sides by
+<code>I(w)</code> makes the response the constant 1 and moves the
+<code>1/I</code> factor onto the bases. That is precisely the
+variance-stabilizing weighting (periodogram-type estimates have standard
+deviation proportional to their mean), implemented by multiplying the
+biased primitive rows by <code>weights = 1/estimate</code>.</li>
+<li><strong>Why ghost knots at 0 and 0.5.</strong> The spectral window’s
+tails wrap power around DC and Nyquist. The basis must be able to place
+power there even though those bins are dropped from the data grid, so
+debias mode appends two off-grid knots at exactly 0 and 1/2
+(<code>splines.knot_grid</code>, <code>ghost_knots=True</code>). They
+are always active — only the on-grid candidates are selectable.</li>
+</ul>
+<h2 id="building-the-bases">3. Building the bases</h2>
+<h3 id="candidate-knots-vs-active-knots">3.1 Candidate knots vs active
+knots</h3>
+<p><code>splines.knot_grid</code> picks
+~<code>len(freqs)/knot_spacing</code> <strong>candidate</strong>
+positions (uniform, or geometric with <code>log_knots=True</code>). The
+latent vector <code>gamma</code> (one 0/1 per <em>interior</em>
+candidate) says which are <strong>active</strong>; the two end knots are
+always active. Candidates are carried as <em>integer grid positions</em>
+(<code>interior_idx</code>), never rediscovered by comparing floats.</p>
+<h3 id="primitives-two-ramps-per-candidate-segment">3.2 Primitives: two
+ramps per candidate segment</h3>
+<p>For every candidate segment <code>[knots[s], knots[s+1]]</code> there
+are two linear primitives: <code>falling_s</code> (1 at the left end, 0
+at the right) and <code>rising_s</code> (the reverse). Any B1 hat on any
+<em>active</em> knot triple is a linear combination of these — that is
+the whole trick. Two primitive tables exist:</p>
+<ul>
+<li><code>half_bases</code> — the ramps evaluated directly on the
+frequency grid;</li>
+<li><code>half_bases_biased</code> — each ramp’s
+<strong>spectral-window-convolved PSD</strong>.</li>
+</ul>
+<h3 id="the-convolution-paid-once">3.3 The convolution, paid once</h3>
+<p><code>half_bases_biased</code> is the only expensive computation in
+the package, and it runs once per <code>PSDebias</code>
+construction:</p>
+<ol type="1">
+<li><code>acf_rising/acf_falling</code> give each ramp’s inverse Fourier
+transform at integer lags <strong>in closed form</strong> (paper Eq. 8;
+the <code>sinc</code>/<code>cos</code> expressions come from integrating
+<code>(m x + b) cos(2 pi x tau)</code> by parts — derivation in the
+<code>_ramp_acf</code> comments).</li>
+<li>Multiplying that ACF by the estimator’s <code>kernel</code> (the
+taper autocorrelation) <strong>is</strong> the convolution with the
+spectral window — the two operations are a Fourier pair.</li>
+<li><code>util.psd_from_acf</code> folds negative lags onto the circular
+lag buffer (<code>r[-tau]</code> aliases to index <code>N - tau</code>)
+and takes one batched <code>rfft</code>, landing every primitive
+<strong>exactly</strong> on the data’s frequency grid. No interpolation,
+no truncation error; <code>tests/test_util.py</code> checks the fold is
+bit-for-bit the original package’s loop, and
+<code>tests/test_splines.py</code> checks the result against brute-force
+numerical convolution.</li>
+</ol>
+<p>After this step, every design matrix ever needed — including one per
+MCMC proposal — is assembled by linear combination alone. Convolution is
+linear, so “combine convolved primitives” equals “convolve the combined
+hat”.</p>
+<h3 id="assembling-a-design-matrix-slope-and-pivot">3.4 Assembling a
+design matrix: slope and pivot</h3>
+<p><code>assemble_design</code> builds one column per active knot. Each
+side of a hat is a line <code>h(x) = slope * (x - pivot)</code>;
+restricted to one candidate segment, a line is exactly
+<code>h(left) * falling_s + h(right) * rising_s</code>. So a column is a
+short sum over the candidate segments its hat spans:</p>
+<pre><code>active knots a &lt; c &lt; d   (hat centred at c, possibly spanning
+                          several candidate segments per side)
+rising side  (a -&gt; c): slope =  1/(c-a), pivot = a
+falling side (c -&gt; d): slope = -1/(d-c), pivot = d
+edge half-hats: one side only</code></pre>
+<p>Worked micro-example: active knots <code>.1 &lt; .2 &lt; .4</code>
+with an inactive candidate at <code>.3</code>. The hat at
+<code>.2</code> falls over two candidate segments <code>[.2,.3]</code>
+and <code>[.3,.4]</code>; on <code>[.3,.4]</code> its contribution is
+<code>h(.3)*falling + h(.4)*rising = 0.5*falling + 0*rising</code> — the
+correct linear piece, using only precomputed <code>[.3,.4]</code>
+primitives.</p>
+<h3 id="the-halve_idx-correction">3.5 The <code>halve_idx</code>
+correction</h3>
+<p>The direct-evaluation primitives are boundary-inclusive: at a grid
+point that <em>is</em> a candidate boundary, <code>rising_{s-1}</code>
+and <code>falling_s</code> are both 1, so the assembly counts the hat’s
+value twice there (and only there). Halving the assembled rows at the
+interior-candidate grid positions (<code>halve_idx</code>) makes the
+design equal the <strong>exact</strong> B1 evaluation everywhere —
+<code>tests/test_splines.py::test_unbiased_equals_direct_evaluation</code>
+asserts this for uniform and random nonuniform configurations. Biased
+primitives are smooth curves with no boundary evaluation, so they take
+an empty <code>halve_idx</code>. This one argument is what replaced four
+near-duplicate functions in the original package.</p>
+<h3 id="incremental-updates">3.6 Incremental updates</h3>
+<p><code>update_design</code> gives each column an identity: the
+candidate-grid indices of its (left neighbour, centre, right neighbour)
+active knots, with sentinels for the two edge columns. A proposal flips
+<code>n_select = 2</code> knots, so almost every column’s triple — hence
+the column itself — is unchanged and gets copied; only O(1) columns are
+recomputed. This is what keeps the per-proposal cost at “a couple of
+column builds + a small least squares” instead of a full rebuild.
+<code>tests/test_design.py</code> walks 200 random flip pairs and
+demands bit-for-bit equality with full assembly.</p>
+<h2 id="the-sampler">4. The sampler</h2>
+<h3 id="the-target-paper-appendix-b">4.1 The target (paper Appendix
+B)</h3>
+<p>For a configuration <code>gamma</code> with <code>q</code> active
+interior knots, <code>p = q + 2</code> design columns, and
+<code>g = len(Y)</code> frequency bins:</p>
+<pre><code>log pi(gamma | Y) =  -(p/2) log(1+c)                        dimension penalty (g-prior)
+                     -(g/2 + a_sigma) log(ESS + 2 b_sigma)  evidence / fit reward
+                     + betaln(q + a_pi, L - q + b_pi)       Beta-Binomial prior
+                     - betaln(a_pi, b_pi)</code></pre>
+<p>with <code>ESS = Y'Y - Y'X beta_hat</code>. Hyperparameter
+intuition:</p>
+<ul>
+<li><code>c</code> (default <code>g</code>, the paper’s choice): bigger
+<code>c</code> = flatter coefficient prior = each extra basis must “pay”
+more evidence. It also shrinks the coefficient draws by
+<code>c/(1+c)</code> (barely, at <code>c ~ 500</code>).</li>
+<li><code>a_pi, b_pi</code>: prior on how many knots you expect;
+<code>(1,1)</code> is uniform over model size.</li>
+<li><code>a_sigma, b_sigma</code>: near-flat IG prior on the noise
+variance; <code>b_sigma</code>’s practical job is keeping
+<code>log(ESS + 2 b_sigma)</code> finite for perfect fits.</li>
+</ul>
+<p>Everything is computed by <code>_log_posterior</code> — one compiled
+function used by <em>both</em> the chain and <code>map_estimate</code>,
+so the sampler and the mode selector can never disagree (the original
+package had two divergent implementations; see CHANGES.md sections
+2.1–2.2 for what was wrong and why results shifted).</p>
+<h3 id="the-mh-loop-_mh_kernel-annotated">4.2 The MH loop
+(<code>_mh_kernel</code>), annotated</h3>
+<pre><code>state: (gamma, design X, chol(X&#39;X), beta_hat, ESS, log_post, p)
+
+for i in warmup + n_iterations:
+    gamma&#39; = gamma with n_select positions set to fresh Bernoulli(1/2)   # symmetric proposal
+    X&#39;     = update_design(...)                # copies unchanged columns
+    solve  = _least_squares(X&#39;, Y)             # Gram -&gt; Cholesky -&gt; beta_hat&#39;, ESS&#39;
+    reject if: Cholesky failed (singular)      # flag, not exception
+            or (debias) any beta_hat&#39; &lt;= 0     # positivity truncation, Alg. 1 line 5
+    else Metropolis: accept iff min(0, dlog_post) &gt; log U[i]
+    on accept: state &lt;- primed versions        # nothing recomputed from scratch
+
+    every thin-th post-warmup iteration:
+        store (gamma, ESS)
+        draw n_beta_draws of (sigma^2, beta):
+            sigma^2 = (ESS + 2 b_sigma) / chi2_{g + 2 a_sigma}
+            beta    = beta_hat + sqrt(sigma^2 * c/(1+c)) * L^{-T} z</code></pre>
+<p>The conditional draw is the paper’s multivariate-t coefficient
+posterior sampled by composition: <code>sigma^2</code> from its
+inverse-gamma conditional, then <code>beta | sigma^2</code> Gaussian.
+<code>L^{-T} z</code> (one triangular solve, no inversion) has
+covariance <code>(X'X)^{-1}</code>.
+<code>tests/test_sampler.py::TestConditionalDraws</code> freezes the
+chain on one configuration and verifies the empirical mean and
+covariance against the analytic values.</p>
+<p>Mechanics worth knowing:</p>
+<ul>
+<li><strong>All randomness is pre-generated</strong> in
+<code>sample()</code> from the single injected
+<code>numpy.random.Generator</code> and consumed sequentially by the
+kernel. That is what makes runs bit-reproducible under a seed (Numba’s
+internal RNG cannot be driven by a <code>Generator</code>).</li>
+<li><strong>Thinning happens inside the kernel.</strong> Only every
+<code>thin</code>-th state is stored, and the conditional-draw randoms
+exist only for kept states. At paper-scale settings this is the
+difference between ~40 MB and ~2.6 GB.</li>
+<li><strong>Storage is rectangular and NaN-padded</strong>:
+<code>betas[i, d, :p_i]</code> are real, the rest NaN,
+<code>p_i = gammas[i].sum() + 2</code>. No ragged lists in compiled
+code.</li>
+</ul>
+<h3 id="initialization-and-the-sunspot-lesson">4.3 Initialization (and
+the sunspot lesson)</h3>
+<p>In debias mode the posterior is <strong>truncated</strong> to
+configurations whose least-squares coefficients are all positive. The
+chain must therefore <em>start</em> inside that region: from a dense
+configuration with negative coefficients, a two-knot flip essentially
+never lands all-positive, so every proposal is rejected and the chain
+freezes at its start forever. This is not hypothetical — an earlier
+version of this package initialized at “all knots active” and froze
+exactly this way on the annual sunspot dataset (acceptance 0.0; the
+regression test
+<code>test_end_to_end.py::test_sunspot_forced_debias_regression</code>
+pins the fix).</p>
+<p><code>_prior_initial_gamma</code> therefore samples the start from
+the prior itself — <code>pi ~ Beta(a_pi, b_pi)</code>,
+<code>gamma_i ~ Bernoulli(pi)</code> — retrying until the unconstrained
+WLS fit is all-positive. Small <code>pi</code> draws give sparse,
+wide-hat configurations, which pass easily; on sunspot data this needs a
+handful of attempts. If a chain still finishes without a single
+acceptance, <code>sample()</code> now emits a
+<code>RuntimeWarning</code> rather than returning frozen samples
+silently.</p>
+<h2 id="outputs">5. Outputs</h2>
+<p><code>_predictive_pass</code> converts stored
+<code>(gamma, beta)</code> samples into spectra:</p>
+<ul>
+<li>Evaluation always uses the <strong>unconvolved</strong> bases — the
+coefficients describe the spectrum <em>before</em> the window blurred
+it; reading them off clean hats is the debiasing.</li>
+<li>Smooth mode exponentiates <strong>each draw</strong> before
+averaging, so <code>FitResult.mean</code> estimates <code>E[S(f)]</code>
+in both modes. (Exponentiating the average instead would give the
+geometric mean — biased low by Jensen.)</li>
+<li>Mean and standard deviation accumulate streamingly; the full
+<code>(n_kept * n_beta_draws, F)</code> draw matrix is materialized only
+with <code>store_predictive=True</code>.</li>
+<li><code>map_estimate()</code> re-scores every stored
+<code>(gamma, ESS)</code> with the same <code>_log_posterior</code> as
+the chain and returns the winner’s averaged curve — the paper’s “Adapt
+Mode” estimate, vs. the posterior mean’s “Adapt Mean”.</li>
+</ul>
+<h2 id="the-regime-diagnostics">6. The regime diagnostics</h2>
+<p>Two diagnostics ship; <code>fit_psd(mode="auto")</code> uses the
+second.</p>
+<h3 id="the-papers-sign-rule-sign_diagnostic-kept-for-reference">6.1 The
+paper’s sign rule (<code>sign_diagnostic</code>, kept for
+reference)</h3>
+<p>Runs the debias regression once with <strong>every</strong> candidate
+active and <strong>no</strong> positivity constraint, and reads the
+coefficient signs: any non-positive coefficient → smooth. The mechanism
+is sound — an estimate <em>less</em> blurred than the bases assume
+forces negative compensation in the tails — but the rule reacts to
+negatives from three other sources too, making it conservative on
+small/noisy data:</p>
+<ol type="1">
+<li><strong>noise</strong> (with ~100 coefficients, some dip negative by
+chance),</li>
+<li><strong>collinearity</strong> (knots finer than the window bandwidth
+are unidentifiable through the blur → coefficient variance
+explodes),</li>
+<li><strong>approximation error</strong> (a fixed B1 mesh’s best fit to
+a sharp spectrum can genuinely need small negatives near peaks).</li>
+</ol>
+<p>Empirically it rejected debiasing on the annual sunspot series — the
+paper’s own flagship debiasing example.</p>
+<h3
+id="the-bandwidth-matched-nnls-gap-rule-regime_diagnostic-recommended">6.2
+The bandwidth-matched NNLS-gap rule (<code>regime_diagnostic</code>,
+recommended)</h3>
+<p>Built on a reframe: the debias sampler never needs the all-knots
+<em>unconstrained</em> fit to be positive — it only ever visits positive
+configurations, so what matters is whether <em>some well-fitting
+positive configuration exists</em>. Non-negative least squares at the
+full mesh answers exactly that. The rule:</p>
+<ol type="1">
+<li><strong>Mesh at the window bandwidth.</strong>
+<code>window_bandwidth(kernel, n_time)</code> computes the spectral
+window’s equivalent width by Parseval
+(<code>B_eq = h[0]^2 / (h[0]^2 + 2 sum h[tau]^2)</code>; Fejer → the
+textbook 1.5 bins, multitaper → ≈ 2·NW bins). The diagnostic mesh
+defaults to <code>ceil(bandwidth)</code> — the finest spacing the blur
+makes identifiable — which removes failure mechanism (2) <em>by
+construction</em>.</li>
+<li><strong>NNLS gap.</strong> Fit the debias regression both
+unconstrained and non-negatively;
+<code>gap_per_constraint = ((RSS_nnls − RSS_ols)/σ̂²) / #(zeroed coefficients)</code>.
+Under a true nonnegative representation each activated constraint costs
+O(σ²) (chi-bar-squared heuristic), so a small gap (default threshold
+4.0) → a positive blur-matched representation fits essentially as well
+as the best linear one → <strong>debias</strong>. A large gap →
+positivity is fighting the data, the blur-mismatch signature →
+<strong>smooth</strong>.</li>
+<li><strong>Evidence report, not just a verdict.</strong>
+<code>RegimeDiagnostic</code> carries bandwidth, the mesh used,
+multiplicity-corrected one-sided t-statistics (SEs inflated by
+<code>sqrt(bandwidth)</code> for within-bandwidth bin correlation —
+these separate noise negatives from systematic ones), a
+residual-inflation factor against the known noise floor
+<code>2/bandwidth</code> of the variance-stabilized regression, the
+design’s condition number, and the old sign rule’s verdict on the same
+design.</li>
+</ol>
+<p>Calibration snapshot (the probe study that set the threshold): true
+Regime-1 cases (AR(4), boxcar Welch, M ∈ {16,32,64}) score ≤ 3.6;
+sunspot multitaper scores 0.27–0.41 (decisively debias, matching the
+paper); a deliberate mismatch (unblurred spectrum presented with a
+heavy-blur kernel) scores far above the threshold and is rejected.</p>
+<p>One consequence to be aware of: variance-dominant but
+<em>blur-consistent</em> scenarios (e.g. Matern under multitaper, where
+<code>E[I] = f * H_n</code> genuinely holds) now dispatch to debias —
+the diagnostic answers “does the blurring match”, not “which regime has
+lower MSE”. That is the intended semantics: when the blur matches,
+debiasing is valid, and the sampler’s model selection still prunes
+toward smooth fits.</p>
+<h3 id="the-mathematics-of-the-gap-rule">6.3 The mathematics of the gap
+rule</h3>
+<h4 id="the-object-being-tested">The object being tested</h4>
+<p>A quadratic estimate at grid frequency <span
+class="math inline">\(\omega_j\)</span> has expectation blurred by the
+estimator’s spectral window (paper Eq. 1–2):</p>
+<p><span class="math display">\[\mathbb{E}\,[\,I(\omega_j)\,] \;=\; (f *
+H_n)(\omega_j), \qquad
+H_n(\omega) \;=\; \sum_{\tau} h[|\tau|]\,
+e^{-i2\pi\omega\tau},\]</span></p>
+<p>where <span class="math inline">\(h[\tau]\)</span> is the kernel
+(taper autocorrelation, <span class="math inline">\(h[0]=1\)</span>).
+Debiasing fits the variance-stabilized regression</p>
+<p><span class="math display">\[Y = \mathbf{1}_g, \qquad
+\tilde X = \mathrm{diag}\!\big(I^{-1}\big)\, X_{H}, \qquad
+(X_H)_{ji} = (B_i * H_n)(\omega_j),\]</span></p>
+<p>i.e. <span class="math inline">\(Y \approx \tilde X\beta +
+\varepsilon\)</span> with <span
+class="math inline">\(\mathrm{Var}(\varepsilon_j)\approx
+\sigma^2\)</span> roughly constant (dividing by <span
+class="math inline">\(I\)</span> stabilizes the mean-proportional noise
+of periodogram-type estimates). The debiased spectrum is read off the
+<em>unconvolved</em> bases, and the sampler only ever visits
+configurations <span class="math inline">\(\gamma\)</span> with <span
+class="math inline">\(\hat\beta(\gamma) &gt; 0\)</span>. The diagnostic
+must decide: is the estimate blurred the way <span
+class="math inline">\(X_H\)</span> assumes — equivalently, does a
+<em>positive</em>, blur-matched representation fit the data?</p>
+<h4 id="why-the-sign-rule-fails">Why the sign rule fails</h4>
+<p>The sign rule computes the unconstrained WLS at the full mesh, <span
+class="math inline">\(\hat\beta = (\tilde X^\top \tilde X)^{-1}\tilde
+X^\top Y\)</span>, and rejects debiasing if <span
+class="math inline">\(\min_j \hat\beta_j \le 0\)</span>. Since <span
+class="math inline">\(\hat\beta \sim \mathcal N\big(\beta^*,\, \sigma^2
+(\tilde X^\top \tilde X)^{-1}\big)\)</span>, three things break it:</p>
+<ol type="1">
+<li><p><strong>Multiplicity.</strong> Even when every true <span
+class="math inline">\(\beta^*_j &gt; 0\)</span>,</p>
+<p><span class="math display">\[\Pr\Big(\min_j \hat\beta_j \le 0\Big)
+  \;=\; 1 - \prod_{j=1}^{p}\Big(1 -
+\Phi\big(-\beta^*_j/\mathrm{se}_j\big)\Big)
+  \;\xrightarrow[p\to\infty]{}\; 1 .\]</span></p>
+<p>With <span class="math inline">\(p\sim 100\)</span> coefficients,
+false alarms are near-certain on noisy data.</p></li>
+<li><p><strong>Collinearity below the bandwidth.</strong> Convolution is
+a smoothing operator: hats narrower than the window’s width map to
+nearly identical columns of <span class="math inline">\(X_H\)</span>, so
+<span class="math inline">\(\lambda_{\min}(\tilde X^\top \tilde X)\to
+0\)</span> and <span class="math inline">\(\mathrm{se}_j \propto
+\lambda_{\min}^{-1/2} \to \infty\)</span> — the <em>sign</em> of <span
+class="math inline">\(\hat\beta_j\)</span> becomes a coin flip.</p></li>
+<li><p><strong>Approximation error.</strong> <span
+class="math inline">\(f\)</span> is generally not in the span of the
+mesh, and the weighted-<span class="math inline">\(L^2\)</span>
+projection of a positive function onto a fixed B1 mesh is <em>not</em>
+positivity-preserving: the pseudo-true coefficient <span
+class="math inline">\(\beta^* = \arg\min_\beta \|\,\mathbb{E}Y - \tilde
+X\beta\,\|^2\)</span> can have genuinely negative entries near sharp
+features (Gibbs-type overshoot). Low noise makes these negatives
+<em>significant</em> — the sign rule then tests the wrong hypothesis
+entirely.</p></li>
+</ol>
+<h4 id="the-reframed-hypothesis-and-the-gap-statistic">The reframed
+hypothesis and the gap statistic</h4>
+<p>The sampler does not need <span
+class="math inline">\(\hat\beta(\mathbf 1_L) &gt; 0\)</span>; it needs
+the positive cone to contain a good fit. Define</p>
+<p><span class="math display">\[\mathrm{RSS} \;=\;
+\min_{\beta\in\mathbb{R}^p} \|Y - \tilde X\beta\|^2,
+\qquad
+\mathrm{RSS}_{+} \;=\; \min_{\beta \ge 0} \|Y - \tilde X\beta\|^2
+,\]</span></p>
+<p>and test</p>
+<p><span class="math display">\[H_0:\; \mathrm{RSS}_+ \approx
+\mathrm{RSS}
+\quad\text{(the positivity cone costs nothing).}\]</span></p>
+<p>NNLS computes <span class="math inline">\(\mathrm{RSS}_+\)</span>
+<strong>exactly</strong>, and — the key structural fact — by the KKT
+conditions its active set is the best positive sub-configuration over
+<em>all</em> <span class="math inline">\(2^L\)</span> knot
+configurations at that mesh: any <span
+class="math inline">\(\gamma\)</span>-submodel with positive
+coefficients is a feasible point of the cone. So <span
+class="math inline">\(\mathrm{RSS}_+\)</span> is precisely the best fit
+the positivity-truncated sampler could ever achieve. The statistic
+is</p>
+<p><span class="math display">\[\Lambda \;=\; \frac{\mathrm{RSS}_+ -
+\mathrm{RSS}}{\hat\sigma^2 \, \max(k, 1)},
+\qquad k = \#\{j : \hat\beta^{+}_j = 0\},
+\qquad \hat\sigma^2 = \frac{\mathrm{RSS}}{g - p}.\]</span></p>
+<p><strong>Null behavior.</strong> When a nonnegative representation
+truly fits, <span class="math inline">\(\mathrm{RSS}_+ -
+\mathrm{RSS}\)</span> is the likelihood-ratio statistic for
+cone-constrained vs unconstrained least squares, whose asymptotic law is
+the chi-bar-squared mixture <span class="math inline">\(\bar\chi^2 =
+\sum_k w_k \chi^2_k\)</span> (Chernoff/Kudo), with each activated
+constraint contributing at most a <span
+class="math inline">\(\chi^2_1\)</span> component. Normalizing per
+activated constraint gives an <span class="math inline">\(O(1)\)</span>
+statistic, and the default threshold <span class="math inline">\(4.0
+\approx \chi^2_{1,\,0.95} = 3.84\)</span> — the calibration probes
+independently landed there (true-Regime-1 cases <span
+class="math inline">\(\le 3.6\)</span>, one borderline realization at
+<span class="math inline">\(4.9\)</span>).</p>
+<p><strong>Alternative behavior.</strong> Under blur mismatch, <span
+class="math inline">\(\mathbb E[I] \approx f\)</span> but the bases are
+<span class="math inline">\(f * H_n\)</span>: the unconstrained fit
+exploits negative lobes to <em>deconvolve</em> the over-blurred bases,
+and forcing <span class="math inline">\(\beta \ge 0\)</span> costs a
+systematic amount <span class="math inline">\(\propto g \cdot
+\|\text{mismatch}\|^2/\sigma^2\)</span> — growing with the data, not
+with <span class="math inline">\(k\)</span>. <span
+class="math inline">\(\Lambda\)</span> therefore separates the
+hypotheses at rate <span class="math inline">\(g\)</span>: noise gives
+<span class="math inline">\(O(1)\)</span>, mismatch gives <span
+class="math inline">\(O(g/k)\)</span>. The deterministic test in
+<code>tests/test_diagnostic.py</code> (unblurred spectrum against a
+heavy-blur kernel) pins the rejection side.</p>
+<h4 id="bandwidth-matching-from-parseval">Bandwidth matching, from
+Parseval</h4>
+<p>The equivalent bandwidth of the window is the width of the flat
+window with the same area and energy:</p>
+<p><span class="math display">\[B_{\mathrm{eq}} \;=\; \frac{\big(\int
+W\big)^2}{\int W^2}
+\;=\; \frac{h[0]^2}{\,h[0]^2 + 2\sum_{\tau\ge 1} h[\tau]^2\,}
+\quad\text{(cycles/sample)},\]</span></p>
+<p>since <span class="math inline">\(\int_{-1/2}^{1/2} W\,d\omega =
+h[0]\)</span> and, by Parseval, <span class="math inline">\(\int W^2 =
+\sum_\tau h[|\tau|]^2\)</span>. Sanity anchors: the Fejér window gives
+<span class="math inline">\(B_{\mathrm{eq}}\, n = 3/2\)</span> bins (the
+textbook value), a multitaper window <span class="math inline">\(\approx
+2NW\)</span> bins.</p>
+<p>Structure finer than <span
+class="math inline">\(B_{\mathrm{eq}}\)</span> is annihilated by the
+convolution — it lies in the small-singular-value subspace of the blur
+operator — so knots spaced finer than <span
+class="math inline">\(B_{\mathrm{eq}}\)</span> are
+<em>unidentifiable</em>, and any statistic computed there is dominated
+by mechanism 2. Flooring the mesh at <span class="math inline">\(\lceil
+B_{\mathrm{eq}}\, n\rceil\)</span> removes that failure mode by
+construction and loses nothing: the data cannot resolve below it anyway.
+It also fixes the degrees-of-freedom accounting — bins within one
+bandwidth are correlated, so the reported t-statistics use</p>
+<p><span class="math display">\[t_j =
+\frac{\hat\beta_j}{\hat\sigma\,\sqrt{[(\tilde X^\top\tilde
+X)^{-1}]_{jj}\; B}},
+\qquad \text{Šidák threshold } z =
+\Phi^{-1}\big((1-\alpha)^{1/p}\big),\]</span></p>
+<p>which discounts noise-driven negatives without hiding systematic
+ones. (One caveat on <code>residual_inflation</code>: the noise floor
+<span class="math inline">\(2/B\)</span> is exact for multitaper-type
+kernels, where the window encodes the full averaging; for Welch the
+segment count lives outside the kernel, so treat it as a relative
+indicator there.)</p>
+<h4 id="why-this-rule-and-its-limits">Why this rule, and its limits</h4>
+<ul>
+<li><strong>It tests the decision-relevant object.</strong> The sampler
+is confined to the positive cone; <span
+class="math inline">\(\Lambda\)</span> measures the <em>cost of that
+cone</em> — small <span class="math inline">\(\Lambda\)</span> is
+exactly the condition under which the debias posterior can concentrate
+near the best linear fit. The sign rule tests a
+sufficient-but-far-from-necessary condition (<span
+class="math inline">\(\hat\beta(\mathbf 1_L)\)</span> interior to the
+cone) with the noisiest available estimator; it is the degenerate <span
+class="math inline">\(\Lambda\)</span>-rule with threshold <span
+class="math inline">\(0\)</span> and no noise calibration.</li>
+<li><strong>It is immune to all three failure mechanisms</strong>:
+multiplicity (the gap aggregates rather than taking a min over <span
+class="math inline">\(p\)</span> noisy signs), collinearity (mesh
+floored at the identifiable bandwidth), approximation error (NNLS
+silently drops Gibbs-affected knots — locally coarsening the mesh — at
+<span class="math inline">\(O(\sigma^2)\)</span> cost, whereas both sign
+and t rules flag them).</li>
+<li><strong>It beats the tested alternatives.</strong> A t-only rule
+still fails on approximation-error negatives (AR(4), <span
+class="math inline">\(M{=}32\)</span>: 55 <em>significant</em> negatives
+in Regime 1). A Bayes factor between convolved and unconvolved bases
+measures blur <em>detectability</em>, which vanishes precisely for
+smooth spectra — indecisive exactly where a decision is still needed —
+at twice the cost. Empirically: sign rule 0/8 correct on the
+debias-truth probes; this rule 7–8/8, sunspots decisive (<span
+class="math inline">\(\Lambda = 0.27\)</span>–<span
+class="math inline">\(0.41\)</span>).</li>
+<li><strong>It is cheap and reproducible</strong>: one OLS and one NNLS
+on a <span class="math inline">\(g \times O(g/B)\)</span> design, no
+sampling, one threshold with a <span
+class="math inline">\(\chi^2_1\)</span> anchor.</li>
+</ul>
+<p>Limits, stated plainly: the per-constraint <span
+class="math inline">\(\chi^2_1\)</span> normalization is a heuristic
+bound on the chi-bar-squared mixture (constraints are correlated and the
+active set is data-chosen); the <span class="math inline">\(\sqrt
+B\)</span> correlation correction is first-order; realizations near the
+threshold can flip (the <span class="math inline">\(M{=}32\)</span> case
+moved between <span class="math inline">\(3.6\)</span> and <span
+class="math inline">\(4.9\)</span> across seeds); and by design the rule
+answers <em>blur match</em>, not <em>MSE dominance</em> — a
+blur-consistent variance-dominant estimate dispatches to debias, where
+the sampler’s own model selection provides the smoothing.</p>
+<h2 id="numerical-engineering-appendix">7. Numerical engineering
+appendix</h2>
+<p><strong>Why a hand-rolled Cholesky returning a flag.</strong> The
+kernel needs to treat a singular Gram matrix (duplicate/degenerate knot
+placements) as an ordinary proposal rejection. <code>try/except</code>
+around LAPACK inside <code>@njit</code> is fragile and slow, so
+<code>_cholesky</code> is ~30 lines of scalar code that returns
+<code>False</code> on a failed pivot (relative floor
+<code>1e-12 * max diag</code>). β̂, ESS, and the coefficient draws all
+reuse the factor through <code>_solve_lower/_solve_upper</code>.
+Verified against <code>np.linalg.lstsq</code> to 1e-9; at p ~ 10–30 the
+O(p^3) cost is microseconds.</p>
+<p><strong>Numba constraints that shaped the kernel:</strong> no
+exceptions in the hot loop, no reflected/typed lists (rectangular
+NaN-padded outputs instead), randoms pre-generated (seedable),
+contiguous arrays throughout. The scalar loops look old-fashioned but
+compile to the same SIMD the vector forms would.</p>
+<p><strong>Cost model per iteration:</strong> one incremental design
+update (O(1) column builds of length F) + one Gram build (O(F p^2), the
+dominant term) + one Cholesky (O(p^3)). Measured ~24k iterations/sec at
+F=511, L=63 on this machine — parity with the original package’s kernel,
+with ~65x less RNG/ storage memory (see CHANGES.md 3.2).</p>
+<p><strong>Where the time really goes end-to-end:</strong> basis
+precomputation is one batched FFT (milliseconds); the MH loop is
+seconds; the predictive pass over kept states is comparable to the loop
+when <code>store_predictive=True</code>.</p>
+<h2 id="suggested-reading-order-and-paper-cross-reference">8. Suggested
+reading order and paper cross-reference</h2>
+<p>Reading order that builds up dependencies naturally:</p>
+<ol type="1">
+<li><code>util.py::psd_from_acf</code> (10 lines that everything else
+leans on)</li>
+<li><code>estimators.py::_taper_kernel</code> + one estimator (what
+<code>kernel</code> means)</li>
+<li><code>splines.py</code> top-of-module docstring, then
+<code>knot_grid</code>, <code>_ramp_acf</code>,
+<code>half_bases_biased</code>, <code>_hat_column</code>,
+<code>_compute_column</code>, <code>assemble_design</code>,
+<code>update_design</code></li>
+<li><code>sampler.py::_log_posterior</code>,
+<code>_least_squares</code>, then <code>_mh_kernel</code> top-to-bottom,
+then <code>PSDebias.__init__</code>/<code>sample</code></li>
+<li><code>diagnostic.py</code>, <code>dwelch.py</code> (short, reuse
+everything above)</li>
+</ol>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>paper</th>
+<th>code</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Eq. 1–2 (bias = convolution with <code>H_n</code>)</td>
+<td><code>estimators._taper_kernel</code>, applied in
+<code>util.psd_from_acf</code></td>
+</tr>
+<tr class="even">
+<td>Eq. 3 (linear model per <code>gamma</code>)</td>
+<td><code>sampler._least_squares</code></td>
+</tr>
+<tr class="odd">
+<td>Eq. 4–5 (spline family, convolved fit)</td>
+<td><code>PSDebias.__init__</code> debias branch;
+<code>dwelch.py</code></td>
+</tr>
+<tr class="even">
+<td>Eq. 6–7 (B0/B1 from latent <code>gamma</code>)</td>
+<td><code>splines.assemble_design</code> (+ <code>basis_b0*</code>)</td>
+</tr>
+<tr class="odd">
+<td>Eq. 8 (primitive inverse FTs)</td>
+<td><code>splines._ramp_acf</code>,
+<code>acf_rising/falling/box</code></td>
+</tr>
+<tr class="even">
+<td>Eq. 9 (chained linear combinations)</td>
+<td><code>splines._hat_column</code> slope/pivot weights</td>
+</tr>
+<tr class="odd">
+<td>Eq. 10 (Beta-Binomial prior)</td>
+<td><code>sampler._log_posterior</code> prior term</td>
+</tr>
+<tr class="even">
+<td>App. B marginal likelihood</td>
+<td><code>sampler._log_posterior</code> likelihood terms</td>
+</tr>
+<tr class="odd">
+<td>App. B multivariate-t coefficients</td>
+<td>conditional draws in <code>_mh_kernel</code></td>
+</tr>
+<tr class="even">
+<td>Algorithm 1</td>
+<td><code>sampler._mh_kernel</code></td>
+</tr>
+<tr class="odd">
+<td>Sec. IV-A smoothing</td>
+<td><code>PSDebias(mode="smooth")</code></td>
+</tr>
+<tr class="even">
+<td>Sec. IV-B debiasing</td>
+<td><code>PSDebias(mode="debias")</code></td>
+</tr>
+<tr class="odd">
+<td>Sec. IV-C diagnostic</td>
+<td><code>diagnostic.sign_diagnostic</code></td>
+</tr>
+</tbody>
+</table>
+<h2 id="where-the-tests-pin-behavior">9. Where the tests pin
+behavior</h2>
+<p>Use these as the safety net when modifying code — each one guards a
+specific invariant:</p>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>test</th>
+<th>invariant</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>test_util.py::test_matches_original_loop_exactly</code></td>
+<td><code>psd_from_acf</code> == original auto-speccy loop,
+bit-for-bit</td>
+</tr>
+<tr class="even">
+<td><code>test_splines.py::test_*_vs_quadrature</code></td>
+<td>closed-form ACFs == numerical integrals (1e-8)</td>
+</tr>
+<tr class="odd">
+<td><code>test_splines.py::test_unbiased_equals_direct_evaluation</code></td>
+<td>assembled design == exact B1 evaluation
+(incl. <code>halve_idx</code>)</td>
+</tr>
+<tr class="even">
+<td><code>test_splines.py::test_biased_column_vs_numerical_convolution</code></td>
+<td>biased bases == dense convolution with the spectral window</td>
+</tr>
+<tr class="odd">
+<td><code>test_design.py::test_incremental_equals_full_random_walk</code></td>
+<td><code>update_design</code> == <code>assemble_design</code>,
+bit-for-bit, 200 random flips</td>
+</tr>
+<tr class="even">
+<td><code>test_sampler.py::test_log_posterior_vs_reference</code></td>
+<td>compiled posterior == independent scipy implementation</td>
+</tr>
+<tr class="odd">
+<td><code>test_sampler.py::TestConditionalDraws</code></td>
+<td>draw moments == analytic Student-t posterior</td>
+</tr>
+<tr class="even">
+<td><code>test_sampler.py::test_determinism</code></td>
+<td>identical seeds give identical <code>FitResult</code>s</td>
+</tr>
+<tr class="odd">
+<td><code>test_sampler.py::test_map_estimate_uses_kernel_posterior</code></td>
+<td>MAP selector and chain share one posterior</td>
+</tr>
+<tr class="even">
+<td><code>test_sampler.py::TestDebiasInitialization</code></td>
+<td>debias init lands inside the positivity support (sunspot data)</td>
+</tr>
+<tr class="odd">
+<td><code>test_dwelch.py::test_matches_original_construction_*</code></td>
+<td>new dwelch assembly == original construction, uniform and
+nonuniform</td>
+</tr>
+<tr class="even">
+<td><code>test_end_to_end.py</code> (slow)</td>
+<td>MSE improvement vs raw estimators on analytic truth; sunspot chain
+mixes</td>
+</tr>
+</tbody>
+</table>
+<h2 id="the-bias-variance-study-scripts-and-notebook">10. The
+bias-variance study (scripts and notebook)</h2>
+<p>Everything outside <code>src/</code> reproduces the paper’s
+simulation study: how much does adaptive smoothing/debiasing improve on
+the raw estimators, the fixed-mesh baseline, and wavelet thresholding?
+Three pieces, run in order:</p>
+<pre><code> scripts/generate_realisations.py debias     -&gt; realisations/{ar4,matern}_debiasing/
+ scripts/generate_realisations.py smooth     -&gt; realisations/{ar4,matern}_unbiased/
+ scripts/wavelet_thresholding.py             -&gt; *_unbiased/**/*_wavelet/   (baseline)
+ notebooks/bias-variance.ipynb               -&gt; MSE/Bias/Var tables + figures</code></pre>
+<p>These need the script extras:
+<code>pip install -e '.[scripts]'</code> (tqdm, PyWavelets, matplotlib,
+scienceplots — none are library dependencies).</p>
+<h3 id="the-two-arms">10.1 The two arms</h3>
+<p>Each arm is one <code>Config</code> in
+<code>generate_realisations.py</code>, chosen by the positional CLI
+argument. The arms deliberately sit in the two regimes of Section 2:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th></th>
+<th><code>debias</code> arm (<code>*_debiasing/</code>)</th>
+<th><code>smooth</code> arm (<code>*_unbiased/</code>)</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>sampler mode</td>
+<td><code>PSDebias(mode="debias")</code></td>
+<td><code>PSDebias(mode="smooth")</code></td>
+</tr>
+<tr class="even">
+<td>Welch</td>
+<td>L=1024, rectangular taper, few long segments</td>
+<td>L=4096, Hanning taper</td>
+</tr>
+<tr class="odd">
+<td>lag-window</td>
+<td>bartlett, NW ∈ {2,4,6,8}, N=2^11</td>
+<td>blackman, NW ∈ {2,3,4,5}, N=2^13</td>
+</tr>
+<tr class="even">
+<td>knot spacing</td>
+<td>4 (Welch) / 8 (quad)</td>
+<td>16 (Welch) / 32 (quad)</td>
+</tr>
+<tr class="odd">
+<td>fixed-mesh baseline</td>
+<td><code>dwelch_b0</code> at the same mesh</td>
+<td>none</td>
+</tr>
+<tr class="even">
+<td>extra baseline</td>
+<td>—</td>
+<td>wavelet thresholding (10.4)</td>
+</tr>
+</tbody>
+</table>
+<p>Short segments + rectangular tapers make the debias arm’s estimates
+bias-dominant (heavy spectral leakage, the window blur is the story);
+long Hanning-tapered segments make the smooth arm variance-dominant.
+Both arms share the machinery — the same four pipeline stages per
+(process, estimator, setting) cell:</p>
+<ol type="1">
+<li><strong>samples</strong> — 200 realisations of AR(4) (paper
+coefficients) and Matern (alpha=1.5, lambda=0.1), cached as
+<code>.npy</code>;</li>
+<li><strong>estimates</strong> — the classical estimator per realisation
+(<code>welch/{m}.npy</code>, <code>lag-window/NW{n}.npy</code>,
+<code>multitaper/NW{n}.npy</code>);</li>
+<li><strong>fixed-mesh debias</strong> (debias arm only) —
+<code>dwelch_b0</code> on a uniform mesh with one knot per
+<code>knot_spacing</code> bins, i.e. <em>the same mesh the sampler
+selects from</em>, so Dquad-vs-PSDebias isolates the value of adaptive
+knot selection rather than mesh resolution. Realisations whose NNLS
+fails or whose debiased spectrum is not strictly positive are dropped,
+so these stacks can have fewer (even zero) rows;</li>
+<li><strong>adaptive fits</strong> — one <code>PSDebias</code> chain per
+realisation (50k iterations, 30k warmup, thin 10, <code>c = n</code> the
+series length as in the original scripts), summarised to one CSV row:
+<code>[E[#knots]] + posterior mean S(f) + posterior std S(f)</code>,
+always linear scale (smooth-mode draws are exponentiated per draw inside
+the sampler).</li>
+</ol>
+<p>Stages 1–3 cache whole arrays (<code>load_or_compute</code>: file
+exists = skip). Stage 4 appends to its CSV row by row and flushes after
+each, so an interrupted run resumes exactly where it stopped — the
+resume position is just the current line count.</p>
+<h3 id="reproducibility-one-rng-stream-per-cell">10.2 Reproducibility:
+one RNG stream per cell</h3>
+<p>There is no global seed. Every random draw comes from
+<code>stream_rng(cfg, tag, i, attempt)</code> =
+<code>np.random.default_rng([seed, crc32(tag), i, attempt])</code> — a
+deterministic stream per (purpose, realisation, attempt). Two
+consequences:</p>
+<ul>
+<li><strong>Resume-safe</strong>: a resumed CSV re-derives the identical
+stream for every row, so an interrupted-and-resumed run is bit-identical
+to an uninterrupted one (verified during development by truncating a CSV
+and diffing the regenerated row).</li>
+<li><strong>Prefix-nested Welch samples</strong>: the Welch sample tag
+omits the segment count, so the m=8 and m=64 samples consume the same
+underlying noise — shorter records are truncations of the same
+realisations, not independent redraws. That reproduces the original
+study’s shared-long-draw design and removes cross-m Monte Carlo noise
+from the “MSE vs number of segments” curves.</li>
+</ul>
+<h3 id="the---screen-option-debias-arm">10.3 The <code>--screen</code>
+option (debias arm)</h3>
+<p>The debias sampler assumes the estimate’s blur matches the kernel
+(Section 6). <code>--screen</code> enforces that <em>by construction on
+the data</em>: each realisation is redrawn (fresh per-attempt stream,
+cap 100) until
+<code>regime_diagnostic(estimate, ...).debias_recommended</code> is true
+for the exact estimator that will consume it — same kernel, same
+<code>n_time</code> the sampler gets. Off by default; without it the
+study measures “PSDebias on whatever the process serves”, with it
+“PSDebias on data certified to be in its regime”.</p>
+<p>Screening forced one layout change: the quad-arm samples are
+per-setting (<code>samples/lag_NW{n}.npy</code>,
+<code>samples/multi_NW{n}.npy</code>) rather than one shared file,
+because the diagnostic’s verdict depends on the estimator and its
+bandwidth — a sample can pass at NW=8 and fail at NW=2. The debias arm
+uses this layout whether or not screening is on (uniform tree); the
+smooth arm keeps the single shared <code>samples/samples.npy</code>.</p>
+<h3 id="the-wavelet-thresholding-baseline">10.4 The wavelet-thresholding
+baseline</h3>
+<p><code>wavelet_thresholding.py</code> is the WPM
+(Walden/Percival/McCoy-style) competitor for the smoothing arm,
+operating in the same log domain the smooth sampler uses. Per
+estimate:</p>
+<ol type="1">
+<li><code>log(estimate)</code> is log-spectrum plus approximately
+log-chi-squared noise with known moments: mean offset
+<code>digamma(K) - log(K)</code>, variance <code>trigamma(K)</code>,
+where <code>K</code> is the estimate’s equivalent degrees-of-freedom —
+the taper count <code>2·NW</code> for multitaper,
+<code>2N / Σ w(τ)²</code> for a lag window, and Welch’s
+overlapped-segment formula for Welch (with non-overlapping segments it
+reduces to <code>2·M</code>).</li>
+<li>Subtract the offset, wavelet-decompose (sym4, periodization,
+reflect-pad to a power of two), soft-threshold the detail coefficients
+at the universal threshold <code>sigma·sqrt(2 log n)</code>, protecting
+the coarsest level so the spectrum’s broad shape survives.</li>
+<li>Reconstruct, add the offset back, exponentiate.</li>
+</ol>
+<p>Estimates are computed on the full rfft grid
+(<code>drop_endpoints=False</code>) so the transform sees the whole log
+spectrum, then trimmed to the endpoint-dropped grid every other stream
+lives on.</p>
+<h3 id="the-notebook">10.5 The notebook</h3>
+<p><code>notebooks/bias-variance.ipynb</code> is one loader/stats/plot
+pipeline driven by a <code>METHODS</code> config table (file patterns,
+x-axis) crossed with arm and signal — every (estimator × arm × process)
+combination the original notebook duplicated by hand. Per realisation
+and stream it computes, in the log domain against the closed-form
+truth,</p>
+<pre><code>MSE  = mean_f (log Ŝ - log S)²      Bias = mean_f (log Ŝ - log S)
+Var  = MSE - Bias²</code></pre>
+<p>then reports each stream’s MSE / Bias² / Var as ratios to the raw
+estimator (&lt; 1 = improvement) and plots mean ± std bands across
+realisations. Two details worth knowing:</p>
+<ul>
+<li><strong>Everything is logged uniformly at stats time.</strong> All
+on-disk streams are linear-scale S(f) — raw estimates, adaptive CSV
+means, Dquad, wavelet — so the loader applies no per-stream log juggling
+(the old notebooks’ <code>log=</code> flag existed because the original
+smooth sampler wrote log-scale CSVs; that distinction is gone).</li>
+<li><strong>Dquad stacks are ragged.</strong> The positivity filter of
+stage 3 means a setting can have any number of surviving rows, including
+zero; the stats keep per-setting lists instead of one rectangular array
+and report NaN where nothing survived (rendered as gaps in the
+plots).</li>
+</ul>
+<p>The final rank bar chart is hand-recorded from the paper’s write-up,
+not derived from the arrays — it is labeled as such in the notebook.</p>
+<h3 id="differences-from-the-retired-auto-speccy-scripts">10.6
+Differences from the retired auto-speccy scripts</h3>
+<p>The scripts this study replaces lived in the original repository and
+used the old <code>MH</code> sampler. Regenerated numbers will not match
+historical runs, deliberately:</p>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>change</th>
+<th>why</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>corrected posterior (CHANGES.md sec. 2)</td>
+<td>the chain now targets the paper’s marginal likelihood</td>
+</tr>
+<tr class="even">
+<td>CSVs linear-scale in both arms</td>
+<td>smooth draws exponentiated per draw (Jensen-correct mean)</td>
+</tr>
+<tr class="odd">
+<td>Welch step = L</td>
+<td>v1 stepped L−1, an accidental 1-sample overlap</td>
+</tr>
+<tr class="even">
+<td>Dquad mesh = sampler <code>knot_spacing</code></td>
+<td>the res0/res1 grids were never actually distinct in v1’s output;
+only the spacing-matched comparison is of interest</td>
+</tr>
+<tr class="odd">
+<td>per-stream seeded RNG</td>
+<td>the originals mixed global <code>np.random</code> state; no run was
+reproducible</td>
+</tr>
+</tbody>
+</table>
+
+</body>
+</html>
