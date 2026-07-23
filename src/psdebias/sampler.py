@@ -523,17 +523,25 @@ class PSDebias:
         fit is all-positive; typically a handful suffice because small ``pi``
         draws produce sparse, wide-hat configurations.
         """
+        yty = float(self.response @ self.response)
         for _ in range(max_attempts):
             pi0 = self.rng.beta(a_pi, b_pi)
             gamma = (self.rng.uniform(size=self.n_interior) < pi0).astype(np.int8)
-            if not self._require_positive:
-                return gamma
+
             design = splines.assemble_design(
                 self._falling_fit, self._rising_fit, gamma, self.knots, self._halve_fit
             )
-            beta, *_ = np.linalg.lstsq(design, self.response, rcond=None)
-            if np.all(beta > 0):
+            p = design.shape[1]
+            beta = np.empty(p)
+            chol = np.empty((p,p))
+
+            ok, _ = _least_squares(design, self.response, yty, beta,chol)
+
+            if not ok:
+                continue
+            if not self._require_positive or np.all(beta > 0):
                 return gamma
+
         raise ValueError(
             f"no initial knot configuration with all-positive coefficients found "
             f"in {max_attempts} prior draws — debiasing is likely not appropriate "
