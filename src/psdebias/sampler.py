@@ -339,6 +339,7 @@ def _predictive_pass(
     halve_idx: npt.NDArray[np.int64],
     exponentiate: bool,
     store: bool,
+    offset: np.float64,
 ):
     """Posterior-predictive evaluation on the *unconvolved* bases.
 
@@ -385,11 +386,13 @@ def _predictive_pass(
     if exponentiate:
         # exp of the log-scale posterior mean; map the log-scale variance to a
         # linear-scale sd via the lognormal relation sd = mean * sqrt(e^var - 1).
-        mean = np.exp(mu)
+
+        # Take offset off mean - Undoing the correction
+        mean = np.exp(mu - offset)
         std = mean * np.sqrt(np.maximum(np.exp(var) - 1.0, 0.0))
     else:
         mean = mu
-        std = np.sqrt(np.maximum(var, 0.0))
+        std = np.sqrt(np.maximum(var, 0.0)) # No negatives
     return mean, std, stored
 
 
@@ -468,7 +471,7 @@ class PSDebias:
                 "freqs must lie strictly inside (0, 0.5): pass the endpoint-dropped "
                 "rfft grid in normalized frequency (fs = 1)"
             )
-
+        self.dof = dof
         self.mode = mode
         self.freqs = freqs
         self.estimate = estimate
@@ -514,9 +517,9 @@ class PSDebias:
             self._falling_fit, self._rising_fit = splines.half_bases(freqs, self.knots)
             self._halve_fit = self._halve_out
             # Add in Correction (Need dof):
-            if dof is None:
+            if self.dof is None:
                 raise ValueError("DOF required for smoothing")
-            offset = np.log(dof) - digamma(dof)
+            offset = np.log(self.dof) - digamma(self.dof)
             self.response = np.log(estimate) + offset
             self._require_positive = False
 
@@ -645,6 +648,7 @@ class PSDebias:
                 stacklevel=2,
             )
 
+        offset = np.log(self.dof) - digamma(self.dof)
         mean, std, stored = _predictive_pass(
             gammas,
             betas,
@@ -654,7 +658,7 @@ class PSDebias:
             self._halve_out,
             self.mode == "smooth",
             store_predictive,
-        )
+            offset=offset
 
         self._hyper = {"a_pi": a_pi, "b_pi": b_pi, "c": float(c),
                        "a_sigma": a_sigma, "b_sigma": b_sigma}
@@ -709,7 +713,9 @@ class PSDebias:
         p = design.shape[1]
         curves = self.result.betas[best, :, :p] @ design.T
         if self.mode == "smooth":
-            curves = np.exp(curves)
+            # Taking away offset
+            offset = np.log(self.dof) - digamma(self.dof)
+            curves = np.exp(curves - offset)
         return gamma_map, curves.mean(axis=0)
 
     def design_matrix(self, gamma: npt.NDArray[np.int8], *, biased: bool) -> npt.NDArray[np.float64]:
