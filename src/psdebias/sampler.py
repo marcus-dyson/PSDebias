@@ -659,6 +659,7 @@ class PSDebias:
             self.mode == "smooth",
             store_predictive,
             offset=offset
+        )
 
         self._hyper = {"a_pi": a_pi, "b_pi": b_pi, "c": float(c),
                        "a_sigma": a_sigma, "b_sigma": b_sigma}
