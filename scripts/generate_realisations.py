@@ -51,10 +51,19 @@ from __future__ import annotations
 
 import argparse
 import csv
+import multiprocessing as mp
 import os
+import sys
 import zlib
 from dataclasses import dataclass, field
 from typing import Callable
+
+# Pin every BLAS/Numba backend to one thread BEFORE numpy imports: each fit is
+# single-threaded and we fan out one worker process per core, so library-level
+# threading would only oversubscribe (P workers x P threads). setdefault leaves
+# any explicit user override intact.
+for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMBA_NUM_THREADS"):
+    os.environ.setdefault(_v, "1")
 
 import numpy as np
 from numpy import typing as npt
@@ -92,7 +101,7 @@ class Config:
     arm: str                    # "debias" | "smooth"
     process_suffix: str         # "_debiasing" | "_unbiased"
     compute_debiasing: bool
-    n_samples: int = 2 #
+    n_samples: int = 200 #
 
     # Welch arm of the study
     segment_length: int = 1024
@@ -112,8 +121,8 @@ class Config:
     knot_spacing_quad: int = 8
 
     # Sampler settings (shared)
-    n_iterations: int = 5_000
-    warmup: int = 3_000
+    n_iterations: int = 50_000
+    warmup: int = 30_000
     thin: int = 10
     n_beta_draws: int = 50
     a_pi: float = 1.0
@@ -355,20 +364,87 @@ def load_or_compute(path: str, compute: Callable, *args, **kwargs):
     return result
 
 
-def append_adaptive_csv(csv_path: str, n_samples: int, row_fn: Callable, desc: str) -> None:
-    """One row per realisation, resuming from the current line count; each row
-    is flushed so the file can be tailed (and the run interrupted) safely."""
+@dataclass
+class RowJob:
+    """Everything one adaptive CSV needs to fit row ``i``. Held in a module
+    global and inherited by forked workers (copy-on-write) so only the integer
+    index is dispatched — the ``estimator`` closure and ``samples`` array never
+    have to pickle."""
+
+    cfg: Config
+    samples: npt.NDArray[np.float64]
+    estimator: Callable            # x -> SpectralEstimate
+    tag: str                       # stream_rng tag, also the row's seed key
+    n_time: int
+    n_series: int
+    knot_spacing: int
+
+
+# Set by _run_adaptive_csv just before the pool forks; read by _row_worker.
+_ROW_JOB: RowJob | None = None
+
+
+def _row_worker(i: int):
+    """Fit realisation ``i`` of the current job. Returns
+    ``(i, expected_knots, mean, std, err)``; on a fit that raises ``ValueError``
+    (debias exhaustion / input validation) returns a NaN sentinel row so the run
+    neither crashes nor deadlocks on resume (the deterministic seed would re-hit
+    the same failure)."""
+    job = _ROW_JOB
+    est = job.estimator(job.samples[i])
+    try:
+        mean, std, expected_knots = run_adaptive(
+            job.cfg, est, n_time=job.n_time, n_series=job.n_series,
+            knot_spacing=job.knot_spacing,
+            rng=stream_rng(job.cfg, job.tag, i),
+        )
+        return i, expected_knots, mean, std, None
+    except ValueError as e:
+        nan = np.full(len(est.freqs), np.nan)
+        return i, float("nan"), nan, nan, str(e)
+
+
+def _run_adaptive_csv(
+    csv_path: str, n_samples: int, job: RowJob, desc: str, workers: int
+) -> None:
+    """One row per realisation, fanned out over ``workers`` processes. Resumes
+    from the current line count; ``imap`` keeps rows in ``i`` order so the
+    resume-by-line-count and the deterministic per-row seed are preserved, and
+    each row is flushed so the file can be tailed and the run interrupted."""
+    global _ROW_JOB
     start_i = 0
     if os.path.exists(csv_path):
         with open(csv_path) as f:
             start_i = sum(1 for _ in f)
+    if start_i >= n_samples:
+        return
 
-    with open(csv_path, "a", newline="") as f:
-        writer = csv.writer(f)
-        for i in tqdm(range(start_i, n_samples), desc=desc, leave=False):
-            mean, std, expected_knots = row_fn(i)
-            writer.writerow([expected_knots] + list(mean) + list(std))
-            f.flush()
+    _ROW_JOB = job
+    try:
+        with open(csv_path, "a", newline="") as f:
+            writer = csv.writer(f)
+
+            def emit(result):
+                i, expected_knots, mean, std, err = result
+                if err is not None:
+                    print(f"[warn] {desc} row {i} failed: {err}", file=sys.stderr)
+                writer.writerow([expected_knots] + list(mean) + list(std))
+                f.flush()
+
+            todo = range(start_i, n_samples)
+            if workers == 1:
+                for i in tqdm(todo, desc=desc, leave=False):
+                    emit(_row_worker(i))
+            else:
+                ctx = mp.get_context("fork")
+                with ctx.Pool(workers) as pool:
+                    for result in tqdm(
+                        pool.imap(_row_worker, todo),
+                        total=n_samples - start_i, desc=desc, leave=False,
+                    ):
+                        emit(result)
+    finally:
+        _ROW_JOB = None
 
 
 # =============================================================================
@@ -394,7 +470,7 @@ def create_directory_structure(cfg: Config) -> None:
                 os.makedirs(os.path.join(_sim_dir(cfg, process, sim), subdir), exist_ok=True)
 
 
-def run_welch_simulations(cfg: Config) -> None:
+def run_welch_simulations(cfg: Config, workers: int) -> None:
     for m in tqdm(cfg.n_segments, desc="Welch: samples/estimates"):
         m = int(m)
         length = m * cfg.segment_length
@@ -429,17 +505,16 @@ def run_welch_simulations(cfg: Config) -> None:
             base = _sim_dir(cfg, process, "welch_sim")
             samples = np.load(os.path.join(base, "samples", f"{m}.npy"))
 
-            def row(i: int, m=m, samples=samples, process=process):
-                est = welch_estimate(cfg, samples[i], m)
-                return run_adaptive(
-                    cfg, est, n_time=cfg.segment_length, n_series=len(samples[i]),
-                    knot_spacing=cfg.knot_spacing_welch,
-                    rng=stream_rng(cfg, f"adapt_welch/{process}/m{m}", i),
-                )
-
-            append_adaptive_csv(
+            job = RowJob(
+                cfg=cfg, samples=samples,
+                estimator=lambda x, m=m: welch_estimate(cfg, x, m),
+                tag=f"adapt_welch/{process}/m{m}",
+                n_time=cfg.segment_length, n_series=int(samples.shape[1]),
+                knot_spacing=cfg.knot_spacing_welch,
+            )
+            _run_adaptive_csv(
                 os.path.join(base, "adapt_welch", f"{m}.csv"),
-                cfg.n_samples, row, f"{process} adapt_welch({cfg.arm}) m={m}",
+                cfg.n_samples, job, f"{process} adapt_welch({cfg.arm}) m={m}", workers,
             )
 
 
@@ -459,7 +534,7 @@ def quad_samples_path(cfg: Config, base: str, name: str, nw: int) -> str:
     return os.path.join(base, "samples", "samples.npy")
 
 
-def run_quad_simulations(cfg: Config) -> None:
+def run_quad_simulations(cfg: Config, workers: int) -> None:
     settings = list(zip(cfg.nws_quad, cfg.lags_quad))
 
     for nw, lag in tqdm(settings, desc="Quad: samples/estimates"):
@@ -499,19 +574,33 @@ def run_quad_simulations(cfg: Config) -> None:
                 estimator = make_estimator(setting)
                 samples = np.load(quad_samples_path(cfg, base, name, nw))
 
-                def row(i: int, estimator=estimator, samples=samples,
-                        name=name, nw=nw, process=process):
-                    est = estimator(samples[i])
-                    return run_adaptive(
-                        cfg, est, n_time=cfg.n_time_quad, n_series=cfg.n_time_quad,
-                        knot_spacing=cfg.knot_spacing_quad,
-                        rng=stream_rng(cfg, f"adapt_{name}/{process}/NW{nw}", i),
-                    )
-
-                append_adaptive_csv(
-                    os.path.join(base, f"adapt_{name}", f"NW{nw}.csv"),
-                    cfg.n_samples, row, f"{process} adapt_{name}({cfg.arm}) NW={nw}",
+                job = RowJob(
+                    cfg=cfg, samples=samples, estimator=estimator,
+                    tag=f"adapt_{name}/{process}/NW{nw}",
+                    n_time=cfg.n_time_quad, n_series=cfg.n_time_quad,
+                    knot_spacing=cfg.knot_spacing_quad,
                 )
+                _run_adaptive_csv(
+                    os.path.join(base, f"adapt_{name}", f"NW{nw}.csv"),
+                    cfg.n_samples, job, f"{process} adapt_{name}({cfg.arm}) NW={nw}", workers,
+                )
+
+
+def _warmup_numba() -> None:
+    """Compile the ``@njit(cache=True)`` kernels once in the parent so forked
+    workers load them from the on-disk cache instead of racing to compile on the
+    first CSV. Best-effort: a tiny smooth-mode fit exercises the shared kernels
+    and never exhausts its init search."""
+    try:
+        n = 128
+        freqs = np.arange(1, n // 2) / n
+        tmp = Config(**SMOOTH_CONFIG)
+        tmp.n_iterations, tmp.warmup, tmp.thin, tmp.n_beta_draws = 2, 1, 1, 2
+        est = SpectralEstimate(freqs, np.ones(len(freqs)) + 0.1, np.zeros(n), np.float64(8.0))
+        run_adaptive(tmp, est, n_time=n, n_series=n, knot_spacing=4,
+                     rng=np.random.default_rng(0))
+    except Exception:  # warmup is an optimization, never fatal
+        pass
 
 
 def main() -> None:
@@ -524,6 +613,9 @@ def main() -> None:
     parser.add_argument("--n-samples", type=int, default=None)
     parser.add_argument("--n-iterations", type=int, default=None)
     parser.add_argument("--warmup", type=int, default=None)
+    parser.add_argument("--workers", type=int, default=None,
+                        help="parallel worker processes for the adaptive fits "
+                             "(default: all cores; 1 runs serially in-process)")
     parser.add_argument("--base-path", type=str, default=None)
     parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
@@ -538,9 +630,14 @@ def main() -> None:
         if value is not None:
             setattr(cfg, name, value)
 
+    workers = args.workers if args.workers is not None else (os.cpu_count() or 1)
+    workers = max(1, workers)
+
     create_directory_structure(cfg)
-    run_welch_simulations(cfg)
-    run_quad_simulations(cfg)
+    if workers > 1:
+        _warmup_numba()
+    run_welch_simulations(cfg, workers)
+    run_quad_simulations(cfg, workers)
 
 
 if __name__ == "__main__":
