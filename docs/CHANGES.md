@@ -30,7 +30,7 @@ oracles inside individual test files).
 | `MH.get_estimates` | `FitResult.mean/std/expected_knots` | replaced |
 | `MH.get_{biased,unbiased}_design_matrix` | `PSDebias.design_matrix(gamma, biased=)` | merged |
 | — | `sampler.fit_psd(mode="auto")` | **new** |
-| — | `diagnostic.sign_diagnostic` | **new** (paper Sec. IV-C) |
+| — | `diagnostic.regime_diagnostic` | **new** (bandwidth-matched NNLS-gap rule) |
 | `solver.posterior` (njit) | `sampler._log_posterior` | fixed |
 | `solver._mcmc_sampling_loop` | `sampler._mh_kernel` | rewritten |
 | `splines.odd_from_even_biased` / `..._unbiased` | `splines.assemble_design(..., halve_idx)` | unified (4 -> 2 fns) |
@@ -178,7 +178,7 @@ so the start must lie inside it. This matches the original's strategy
 (`solver.py:462-489`) but fixes its never-firing exhaustion guard
 (`elif attempt == max_attempts` inside `range(max_attempts)`) and removes the
 redundant first draw that was immediately overwritten (`solver.py:443-448`).
-On exhaustion the new code raises with a pointer to `sign_diagnostic` /
+On exhaustion the new code raises with a pointer to `regime_diagnostic` /
 `mode="smooth"`.
 
 *History note:* the first cut of this rewrite instead started debias chains
@@ -201,14 +201,10 @@ fixed seed is now a test.
 
 ## 4. New features
 
-* **`sign_diagnostic`** (`diagnostic.py`): the paper's Sec. IV-C
-  debias-or-smooth rule — all-knots weighted least squares on the
-  window-convolved bases; debias only when every coefficient is positive.
-  Described in the paper but absent from the original library (it existed
-  only informally in a notebook).
 * **`regime_diagnostic` + `window_bandwidth`** (`diagnostic.py`): the
-  recommended replacement for the sign rule, and what
-  `fit_psd(mode="auto")` now uses. The sign rule false-negatives on small or
+  debias-or-smooth rule `fit_psd(mode="auto")` uses. It replaces the paper's
+  Sec. IV-C sign rule (all-knots WLS on the window-convolved bases; debias
+  only when every coefficient is positive), which false-negatives on small or
   noisy data (noise-driven negative coefficients; collinearity of
   window-convolved bases below the window bandwidth; approximation-error
   negatives on sharp spectra). The new rule (a) computes the spectral
@@ -217,15 +213,14 @@ fixed seed is now a test.
   and (b) decides by the non-negative-least-squares fit gap: debias iff a
   *positive* blur-matched representation fits essentially as well as the
   best unconstrained one (which is all the positivity-truncated sampler
-  needs). Bandwidth-corrected t-statistics, a residual-inflation factor,
-  the condition number, and the old rule's verdict are reported alongside.
+  needs). `RegimeDiagnostic` reports the decision plus `gap_per_constraint`,
+  `n_constrained`, `bandwidth_bins`, `knot_spacing`, and `condition_number`.
   On the calibration probes it recovers the paper's intended verdict in
   every bias-dominant case, including the sunspot series where the sign
-  rule refused to debias. **Note the semantics change of
-  `fit_psd(mode="auto")`**: less conservative; blur-consistent
-  variance-dominant scenarios (e.g. Matern under multitaper) now dispatch
-  to debias. The old behavior remains available by calling
-  `sign_diagnostic` and dispatching manually.
+  rule refused to debias. **Note the semantics of `fit_psd(mode="auto")`**:
+  less conservative than the paper's sign rule; blur-consistent
+  variance-dominant scenarios (e.g. Matern under multitaper) dispatch to
+  debias, where the sampler's own model selection provides the smoothing.
 * **`fit_psd(estimate, freqs, kernel=..., n_time=..., mode="auto")`**: the
   paper's full workflow in one call — diagnostic, regime dispatch, sampling,
   posterior summary.

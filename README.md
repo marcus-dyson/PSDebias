@@ -93,8 +93,7 @@ _, debiased = dwelch_b1(psd, freqs, gamma=gamma, kernel=kernel, n_time=1024)
 | `periodogram, welch, lag_window, multitaper` | classical estimators; each returns `SpectralEstimate(freqs, psd, kernel)` where `kernel` is the one-sided bias sequence `h[tau]` the debiasing machinery needs |
 | `fit_psd` | diagnostic + regime dispatch + sampling + posterior summary in one call |
 | `PSDebias` | the sampler class (`sample`, `map_estimate`, `design_matrix`) |
-| `regime_diagnostic`, `window_bandwidth` | recommended debias-or-smooth rule (bandwidth-matched NNLS-gap; used by `mode="auto"`) |
-| `sign_diagnostic` | paper Sec. IV-C sign rule (kept as the reference behavior) |
+| `regime_diagnostic`, `window_bandwidth` | debias-or-smooth rule (bandwidth-matched NNLS-gap; used by `mode="auto"`) |
 | `dwelch_b0, dwelch_b1` | fixed-knot debiasing (B0 / B1 bases, arbitrary nonuniform knots) |
 | `ar_spectrum, matern_acf, matern_spectrum` | closed-form validation targets |
 | `sample_ar, sample_matern` | seeded process simulators (AR via `lfilter`, Matern via circulant embedding) |
@@ -115,7 +114,7 @@ units afterwards.
 | Algorithm 1 (MH with subset flips, positivity in debias mode) | `sampler._mh_kernel` |
 | Sec. IV-A smoothing (log domain) | `PSDebias(mode="smooth")` |
 | Sec. IV-B debiasing (linear domain, weighted) | `PSDebias(mode="debias")` |
-| Sec. IV-C sign diagnostic | `diagnostic.sign_diagnostic`, `fit_psd(mode="auto")` |
+| Sec. IV-C diagnostic (replaced by the gap rule) | `diagnostic.regime_diagnostic`, `fit_psd(mode="auto")` |
 
 Per-iteration cost is O(N log N)-equivalent: the spectral-window convolutions
 are precomputed once, each MH step reassembles only the design columns whose

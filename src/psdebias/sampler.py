@@ -377,7 +377,9 @@ def _predictive_pass(
             total_sq += curve * curve
             if store:
                 if exponentiate:
-                    stored[i * n_beta_draws + d] = np.exp(curve)
+                    # strip the sampling offset so predictive draws share the
+                    # PSD scale of `mean` (= their geometric mean, exp of E[log])
+                    stored[i * n_beta_draws + d] = np.exp(curve - offset)
                 else:
                     stored[i * n_beta_draws + d] = curve
 
@@ -565,7 +567,7 @@ class PSDebias:
         raise ValueError(
             f"no initial knot configuration with all-positive coefficients found "
             f"in {max_attempts} prior draws — debiasing is likely not appropriate "
-            f"for this estimate; run sign_diagnostic() or use mode='smooth'"
+            f"for this estimate; run regime_diagnostic() or use mode='smooth'"
         )
 
     def sample(
@@ -643,12 +645,12 @@ class PSDebias:
             warnings.warn(
                 "MCMC chain never accepted a proposal — every stored sample is the "
                 "initial configuration and the results are unreliable. Check "
-                "sign_diagnostic() and consider mode='smooth'.",
+                "regime_diagnostic() and consider mode='smooth'.",
                 RuntimeWarning,
                 stacklevel=2,
             )
 
-        offset = np.log(self.dof) - digamma(self.dof)
+        offset = (np.log(self.dof) - digamma(self.dof)) if self.mode == "smooth" else 0.0
         mean, std, stored = _predictive_pass(
             gammas,
             betas,
@@ -750,9 +752,7 @@ def fit_psd(
     representation fit essentially as well as the best unconstrained one?) —
     and dispatches to ``"debias"`` or ``"smooth"`` accordingly. The diagnostic
     chooses its own mesh from the window bandwidth, independent of the
-    sampler's ``knot_spacing``. The paper's stricter Sec. IV-C sign rule
-    remains available as :func:`psdebias.diagnostic.sign_diagnostic` for
-    manual dispatch. Requires ``kernel`` and ``n_time`` unless
+    sampler's ``knot_spacing``. Requires ``kernel`` and ``n_time`` unless
     ``mode="smooth"``.
     """
     from psdebias.diagnostic import regime_diagnostic

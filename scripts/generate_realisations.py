@@ -328,7 +328,7 @@ def run_adaptive(
     if cfg.arm == "debias":
         sampler = PSDebias(
             est.psd, est.freqs, mode="debias", kernel=est.kernel, n_time=n_time,
-            knot_spacing=knot_spacing, rng=rng,
+            dof=est.dof, knot_spacing=knot_spacing, rng=rng,
         )
     else:
         sampler = PSDebias(

@@ -30,7 +30,7 @@ Contents:
  estimators.py  ->  (freqs, psd, kernel)          kernel = taper autocorrelation
       |                                            = the estimator's bias, as a sequence
       v
- diagnostic.sign_diagnostic  ->  debias or smooth?         [fit_psd(mode="auto")]
+ diagnostic.regime_diagnostic  ->  debias or smooth?       [fit_psd(mode="auto")]
       |
       v
  sampler.PSDebias(mode=...)      builds bases ONCE   (splines.half_bases[_biased])
@@ -49,7 +49,7 @@ File map (all under `src/psdebias/`):
 | `util.py` | `psd_from_acf` (lag-domain -> rfft-grid transform, the workhorse), grid helpers |
 | `splines.py` | everything about bases: candidate knots, primitives, closed-form ACFs, design-matrix assembly + incremental update |
 | `sampler.py` | the Numba MH kernel, the `PSDebias` class, `fit_psd` |
-| `diagnostic.py` | the Sec. IV-C sign rule |
+| `diagnostic.py` | the debias-or-smooth regime diagnostic (bandwidth-matched NNLS-gap rule) |
 | `dwelch.py` | fixed-mesh debiasing baselines (NNLS instead of a sampler) |
 | `analytic.py`, `simulate.py` | closed-form spectra and process simulators for validation |
 
@@ -276,18 +276,20 @@ now emits a `RuntimeWarning` rather than returning frozen samples silently.
   `_log_posterior` as the chain and returns the winner's averaged curve —
   the paper's "Adapt Mode" estimate, vs. the posterior mean's "Adapt Mean".
 
-## 6. The regime diagnostics
+## 6. The regime diagnostic
 
-Two diagnostics ship; `fit_psd(mode="auto")` uses the second.
+One diagnostic ships — `regime_diagnostic`, used by `fit_psd(mode="auto")`.
+Section 6.1 is background on the paper's sign rule that motivates it (that rule
+is **not** implemented here); 6.2 is the shipped rule.
 
-### 6.1 The paper's sign rule (`sign_diagnostic`, kept for reference)
+### 6.1 Background: the paper's sign rule (not implemented here)
 
-Runs the debias regression once with **every** candidate active and **no**
-positivity constraint, and reads the coefficient signs: any non-positive
-coefficient → smooth. The mechanism is sound — an estimate *less* blurred
-than the bases assume forces negative compensation in the tails — but the
-rule reacts to negatives from three other sources too, making it conservative
-on small/noisy data:
+The paper's Sec. IV-C rule runs the debias regression once with **every**
+candidate active and **no** positivity constraint, and reads the coefficient
+signs: any non-positive coefficient → smooth. The mechanism is sound — an
+estimate *less* blurred than the bases assume forces negative compensation in
+the tails — but the rule reacts to negatives from three other sources too,
+making it conservative on small/noisy data:
 
 1. **noise** (with ~100 coefficients, some dip negative by chance),
 2. **collinearity** (knots finer than the window bandwidth are unidentifiable
@@ -296,9 +298,10 @@ on small/noisy data:
    can genuinely need small negatives near peaks).
 
 Empirically it rejected debiasing on the annual sunspot series — the paper's
-own flagship debiasing example.
+own flagship debiasing example. This package does not ship it; the gap rule
+below replaces it.
 
-### 6.2 The bandwidth-matched NNLS-gap rule (`regime_diagnostic`, recommended)
+### 6.2 The bandwidth-matched NNLS-gap rule (`regime_diagnostic`)
 
 Built on a reframe: the debias sampler never needs the all-knots
 *unconstrained* fit to be positive — it only ever visits positive
@@ -320,13 +323,11 @@ exactly that. The rule:
    → a positive blur-matched representation fits essentially as well as the
    best linear one → **debias**. A large gap → positivity is fighting the
    data, the blur-mismatch signature → **smooth**.
-3. **Evidence report, not just a verdict.** `RegimeDiagnostic` carries
-   bandwidth, the mesh used, multiplicity-corrected one-sided t-statistics
-   (SEs inflated by `sqrt(bandwidth)` for within-bandwidth bin correlation —
-   these separate noise negatives from systematic ones), a residual-inflation
-   factor against the known noise floor `2/bandwidth` of the
-   variance-stabilized regression, the design's condition number, and the old
-   sign rule's verdict on the same design.
+3. **Evidence report, not just a verdict.** `RegimeDiagnostic` carries the
+   decision (`debias_recommended`) plus the supporting evidence:
+   `gap_per_constraint`, the number of coefficients NNLS pinned at zero
+   (`n_constrained`), the window bandwidth (`bandwidth_bins`), the mesh spacing
+   used (`knot_spacing`), and the design's `condition_number`.
 
 Calibration snapshot (the probe study that set the threshold): true Regime-1
 cases (AR(4), boxcar Welch, M ∈ {16,32,64}) score ≤ 3.6; sunspot multitaper
@@ -366,9 +367,9 @@ only ever visits configurations $\gamma$ with $\hat\beta(\gamma) > 0$. The
 diagnostic must decide: is the estimate blurred the way $X_H$ assumes —
 equivalently, does a *positive*, blur-matched representation fit the data?
 
-#### Why the sign rule fails
+#### Why a naive sign rule fails
 
-The sign rule computes the unconstrained WLS at the full mesh,
+A naive sign rule computes the unconstrained WLS at the full mesh,
 $\hat\beta = (\tilde X^\top \tilde X)^{-1}\tilde X^\top Y$, and rejects
 debiasing if $\min_j \hat\beta_j \le 0$. Since
 $\hat\beta \sim \mathcal N\big(\beta^*,\, \sigma^2 (\tilde X^\top \tilde X)^{-1}\big)$,
@@ -459,25 +460,14 @@ it lies in the small-singular-value subspace of the blur operator — so knots
 spaced finer than $B_{\mathrm{eq}}$ are *unidentifiable*, and any statistic
 computed there is dominated by mechanism 2. Flooring the mesh at
 $\lceil B_{\mathrm{eq}}\, n\rceil$ removes that failure mode by construction
-and loses nothing: the data cannot resolve below it anyway. It also fixes the
-degrees-of-freedom accounting — bins within one bandwidth are correlated, so
-the reported t-statistics use
-
-$$t_j = \frac{\hat\beta_j}{\hat\sigma\,\sqrt{[(\tilde X^\top\tilde X)^{-1}]_{jj}\; B}},
-\qquad \text{Šidák threshold } z = \Phi^{-1}\big((1-\alpha)^{1/p}\big),$$
-
-which discounts noise-driven negatives without hiding systematic ones. (One
-caveat on `residual_inflation`: the noise floor $2/B$ is exact for
-multitaper-type kernels, where the window encodes the full averaging; for
-Welch the segment count lives outside the kernel, so treat it as a relative
-indicator there.)
+and loses nothing: the data cannot resolve below it anyway.
 
 #### Why this rule, and its limits
 
 * **It tests the decision-relevant object.** The sampler is confined to the
   positive cone; $\Lambda$ measures the *cost of that cone* — small
   $\Lambda$ is exactly the condition under which the debias posterior can
-  concentrate near the best linear fit. The sign rule tests a
+  concentrate near the best linear fit. A naive sign rule tests a
   sufficient-but-far-from-necessary condition ($\hat\beta(\mathbf 1_L)$
   interior to the cone) with the noisiest available estimator; it is the
   degenerate $\Lambda$-rule with threshold $0$ and no noise calibration.
@@ -485,22 +475,22 @@ indicator there.)
   aggregates rather than taking a min over $p$ noisy signs), collinearity
   (mesh floored at the identifiable bandwidth), approximation error (NNLS
   silently drops Gibbs-affected knots — locally coarsening the mesh — at
-  $O(\sigma^2)$ cost, whereas both sign and t rules flag them).
-* **It beats the tested alternatives.** A t-only rule still fails on
+  $O(\sigma^2)$ cost, whereas a sign rule flags them).
+* **It beats the tested alternatives.** A t-test on the signs still fails on
   approximation-error negatives (AR(4), $M{=}32$: 55 *significant* negatives
   in Regime 1). A Bayes factor between convolved and unconvolved bases
   measures blur *detectability*, which vanishes precisely for smooth spectra
   — indecisive exactly where a decision is still needed — at twice the cost.
-  Empirically: sign rule 0/8 correct on the debias-truth probes; this rule
-  7–8/8, sunspots decisive ($\Lambda = 0.27$–$0.41$).
+  Empirically: a sign rule scores 0/8 correct on the debias-truth probes; this
+  rule 7–8/8, sunspots decisive ($\Lambda = 0.27$–$0.41$).
 * **It is cheap and reproducible**: one OLS and one NNLS on a
   $g \times O(g/B)$ design, no sampling, one threshold with a $\chi^2_1$
   anchor.
 
 Limits, stated plainly: the per-constraint $\chi^2_1$ normalization is a
 heuristic bound on the chi-bar-squared mixture (constraints are correlated
-and the active set is data-chosen); the $\sqrt B$ correlation correction is
-first-order; realizations near the threshold can flip (the $M{=}32$ case
+and the active set is data-chosen); realizations near the threshold can flip
+(the $M{=}32$ case
 moved between $3.6$ and $4.9$ across seeds); and by design the rule answers
 *blur match*, not *MSE dominance* — a blur-consistent variance-dominant
 estimate dispatches to debias, where the sampler's own model selection
@@ -559,7 +549,7 @@ Reading order that builds up dependencies naturally:
 | Algorithm 1 | `sampler._mh_kernel` |
 | Sec. IV-A smoothing | `PSDebias(mode="smooth")` |
 | Sec. IV-B debiasing | `PSDebias(mode="debias")` |
-| Sec. IV-C diagnostic | `diagnostic.sign_diagnostic` |
+| Sec. IV-C diagnostic | `diagnostic.regime_diagnostic` (replaces the paper's sign rule) |
 
 ## 9. Where the tests pin behavior
 

@@ -1,14 +1,8 @@
-"""Debias-or-smooth diagnostics.
+"""Debias-or-smooth diagnostic.
 
-Two diagnostics live here:
-
-* :func:`sign_diagnostic` — the paper's Sec. IV-C rule, kept verbatim for
-  reproducibility: fit the all-knots configuration by unconstrained WLS on the
-  window-convolved bases and recommend debiasing only if every coefficient is
-  positive.
-* :func:`regime_diagnostic` — the recommended replacement (used by
-  ``fit_psd(mode="auto")``). Less conservative, and robust to the three
-  mechanisms that make the sign rule cry wolf on small or noisy data:
+* :func:`regime_diagnostic` — the debias-or-smooth decision (used by
+  ``fit_psd(mode="auto")``). Robust to the three mechanisms that make a naive
+  all-positive test cry wolf on small or noisy data:
 
   1. **Sampling noise.** With ~100 coefficients, some unconstrained estimates
      dip below zero by chance even when every true coefficient is positive.
@@ -20,7 +14,7 @@ Two diagnostics live here:
      weighted-L2 fit can genuinely need small negative coefficients near
      peaks; low noise makes these systematic negatives look "significant".
 
-  The reframe behind the new rule: the debias sampler never needs the
+  The reframe behind the rule: the debias sampler never needs the
   all-knots *unconstrained* fit to be positive — it needs *some well-fitting
   positive configuration to exist*, because it only ever visits positive
   configurations. Non-negative least squares at the full mesh tests exactly
@@ -42,7 +36,6 @@ from dataclasses import dataclass
 
 import numpy as np
 import scipy.optimize
-import scipy.stats
 from numpy import typing as npt
 
 from psdebias import splines
@@ -108,48 +101,7 @@ def window_bandwidth(kernel: npt.NDArray[np.float64], n_time: int) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Paper Sec. IV-C sign rule (kept for reproducibility)
-# ---------------------------------------------------------------------------
-
-@dataclass(frozen=True)
-class DiagnosticResult:
-    debias_recommended: bool
-    beta: npt.NDArray[np.float64]
-    n_negative: int
-
-
-def sign_diagnostic(
-    estimate: npt.NDArray[np.float64],
-    freqs: npt.NDArray[np.float64],
-    *,
-    kernel: npt.NDArray[np.float64],
-    n_time: int,
-    knot_spacing: int = 4,
-    log_knots: bool = False,
-) -> DiagnosticResult:
-    """The paper's Sec. IV-C rule, verbatim: all-knots unconstrained WLS on
-    the window-convolved bases; debias only when every coefficient is
-    positive.
-
-    Mechanism: if the estimate is *less* blurred than its expectation
-    (Regime 2), the window-convolved bases push too much power into the
-    low-power tails and the least-squares fit can only compensate by turning
-    coefficients negative. The rule reads that signature — but it also reacts
-    to negatives from noise, collinearity, and approximation error, making it
-    conservative on small data. Prefer :func:`regime_diagnostic` for
-    decision-making; this function is kept as the paper's reference rule.
-    """
-    estimate, freqs, kernel = _validate(estimate, freqs, kernel, n_time)
-    design = _full_mesh_design(estimate, freqs, kernel, n_time, knot_spacing, log_knots)
-    beta, *_ = np.linalg.lstsq(design, np.ones(len(estimate)), rcond=None)
-    n_negative = int(np.sum(beta <= 0))
-    return DiagnosticResult(
-        debias_recommended=n_negative == 0, beta=beta, n_negative=n_negative
-    )
-
-
-# ---------------------------------------------------------------------------
-# Bandwidth-matched NNLS-gap diagnostic (recommended)
+# Bandwidth-matched NNLS-gap diagnostic
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -177,7 +129,6 @@ def regime_diagnostic(
     knot_spacing: int | None = None,
     log_knots: bool = False,
     gap_threshold: float = 4.0,
-    alpha: float = 0.05,
 ) -> RegimeDiagnostic:
     """Should this estimate be debiased? Bandwidth-matched NNLS-gap rule.
 

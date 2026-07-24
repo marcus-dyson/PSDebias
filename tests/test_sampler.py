@@ -193,9 +193,10 @@ class TestPSDebias:
         assert res.posterior_predictive is not None
         n_kept = (500 + 4) // 5
         assert res.posterior_predictive.shape == (n_kept * 4, len(freqs))
-        np.testing.assert_allclose(
-            res.posterior_predictive.mean(axis=0), res.mean, rtol=1e-10
-        )
+        # smooth `mean` is the plug-in exp(E[log S]) = the geometric mean of the
+        # (offset-stripped) predictive draws, not their arithmetic mean.
+        geo_mean = np.exp(np.log(res.posterior_predictive).mean(axis=0))
+        np.testing.assert_allclose(geo_mean, res.mean, rtol=1e-10)
 
     def test_initial_gamma_override(self, welch_ar4):
         freqs, psd, _, dof = welch_ar4

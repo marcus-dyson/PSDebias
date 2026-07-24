@@ -4,15 +4,13 @@ Implements PSDebias (Dyson, Astfalck, Cripps & Stemler, "Adaptive Smoothing of
 Quadratic Spectral Estimators"): Bayesian B1-spline knot selection over
 spectral estimates, smoothing variance-dominant estimates in the log domain
 and debiasing bias-dominant estimates through spectral-window-convolved bases,
-with the regime chosen by a data-driven sign diagnostic.
+with the regime chosen by a data-driven regime diagnostic.
 """
 
 from psdebias.analytic import ar_spectrum, matern_acf, matern_spectrum
 from psdebias.diagnostic import (
-    DiagnosticResult,
     RegimeDiagnostic,
     regime_diagnostic,
-    sign_diagnostic,
     window_bandwidth,
 )
 from psdebias.dwelch import dwelch_b0, dwelch_b1
@@ -29,7 +27,6 @@ from psdebias.simulate import sample_ar, sample_matern
 __version__ = "0.1.0"
 
 __all__ = [
-    "DiagnosticResult",
     "FitResult",
     "PSDebias",
     "RegimeDiagnostic",
@@ -46,7 +43,6 @@ __all__ = [
     "regime_diagnostic",
     "sample_ar",
     "sample_matern",
-    "sign_diagnostic",
     "welch",
     "window_bandwidth",
 ]
