@@ -98,7 +98,9 @@ def wpm_threshold_logspectrum(
     coeffs = pywt.wavedec(padded, wavelet, level=levels, mode="periodization")
 
     lam = sigma * np.sqrt(2 * np.log(len(padded)))
-    for j in range(1, len(coeffs) - coarse_keep):
+    # wavedec orders coefficients [cA_n, cD_n (coarsest), ..., cD_1 (finest)],
+    # so the levels to protect sit at the front of the detail block.
+    for j in range(1 + coarse_keep, len(coeffs)):
         coeffs[j] = _soft(coeffs[j], lam)
 
     cleaned = pywt.waverec(coeffs, wavelet, mode="periodization")[:n_freq]
