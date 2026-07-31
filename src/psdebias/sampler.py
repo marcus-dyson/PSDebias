@@ -575,7 +575,7 @@ class PSDebias:
         *,
         n_iterations: int = 50_000,
         warmup: int = 30_000,
-        thin: int = 10,
+        thin: int = 1,
         n_select: int = 2,
         n_beta_draws: int = 50,
         a_pi: float = 1.0,
