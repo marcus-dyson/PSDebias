@@ -13,10 +13,7 @@ One script, two arms::
 The debias arm runs the sampler in ``mode="debias"`` and also computes the
 fixed-mesh ``dwelch_b0`` baselines; the smooth arm runs ``mode="smooth"``
 with no closed-form debiasing. ``--n-samples/--n-iterations/--warmup`` exist
-for smoke runs; ``--screen`` (debias arm only) redraws each realisation until
-``psdebias.regime_diagnostic`` recommends debiasing for the estimator that
-will consume it, so screened data lies inside the regime the debias sampler
-assumes.
+for smoke runs.
 
 Output tree (``<suffix>`` is ``_debiasing`` or ``_unbiased``)::
 
@@ -28,8 +25,8 @@ Output tree (``<suffix>`` is ``_debiasing`` or ``_unbiased``)::
     `-- matern<suffix>/ (same structure)
 
 In the debias arm the quad samples are per-setting (``samples/lag_NW{n}.npy``,
-``samples/multi_NW{n}.npy``) so each can be screened against its own
-estimator; the smooth arm keeps one shared ``samples/samples.npy`` (which
+``samples/multi_NW{n}.npy``), one file per estimator; the smooth arm keeps
+one shared ``samples/samples.npy`` (which
 ``wavelet_thresholding.py`` also reads). Adaptive CSVs hold one row per
 realisation, ``[E[#knots]] + mean_S(f) + std_S(f)``, appended and flushed as
 they finish so interrupted runs resume from the last complete row.
@@ -74,7 +71,6 @@ from psdebias import (
     dwelch_b0,
     lag_window,
     multitaper,
-    regime_diagnostic,
     sample_ar,
     sample_matern,
     welch,
@@ -142,8 +138,6 @@ class Config:
     ar_burn_in: int = 1000
 
     seed: int = 42
-    screen: bool = False
-    screen_max_attempts: int = 100
     base_path: str = "./realisations"
 
 
@@ -177,7 +171,7 @@ SMOOTH_CONFIG = dict(
 
 
 # =============================================================================
-# RNG: one deterministic stream per (purpose, setting, realisation, attempt)
+# RNG: one deterministic stream per (purpose, setting, realisation)
 # =============================================================================
 
 
@@ -185,14 +179,14 @@ def stream_rng(cfg: Config, tag: str, *keys: int) -> np.random.Generator:
     """Independent generator keyed by a string tag plus integer indices.
 
     Every random draw in the script comes from one of these, so a resumed run
-    (or a screening redraw) reproduces exactly the stream it would have used
-    in a single uninterrupted run.
+    reproduces exactly the stream it would have used in a single uninterrupted
+    run.
     """
     return np.random.default_rng([cfg.seed, zlib.crc32(tag.encode()), *keys])
 
 
 # =============================================================================
-# Sample generation (with optional debias-regime screening)
+# Sample generation
 # =============================================================================
 
 
@@ -212,47 +206,16 @@ def draw_process(cfg: Config, process: str, length: int, rng: np.random.Generato
     )[0, :length]
 
 
-def build_samples(
-    cfg: Config,
-    process: str,
-    length: int,
-    tag: str,
-    passes_screen: Callable[[npt.NDArray[np.float64]], bool] | None,
-):
-    """Draw ``cfg.n_samples`` realisations, redrawing each until it passes.
+def build_samples(cfg: Config, process: str, length: int, tag: str):
+    """Draw ``cfg.n_samples`` realisations of ``process``.
 
-    ``passes_screen`` is None when screening is off (every draw accepted on
-    attempt 0). With screening on, each realisation is redrawn from a fresh
-    per-attempt stream until the regime diagnostic recommends debiasing.
+    The trailing 0 in each stream key is the retired screening attempt index,
+    kept so cached realisations still reproduce bit-for-bit.
     """
-    rows = []
-    for i in range(cfg.n_samples):
-        for attempt in range(cfg.screen_max_attempts):
-            x = draw_process(cfg, process, length, stream_rng(cfg, tag, i, attempt))
-            if passes_screen is None or passes_screen(x):
-                rows.append(x)
-                break
-        else:
-            raise RuntimeError(
-                f"screening exhausted {cfg.screen_max_attempts} attempts for "
-                f"{tag} realisation {i}: the regime diagnostic keeps rejecting "
-                f"debiasing for this process/estimator combination"
-            )
-    return np.array(rows)
-
-
-def debias_screen(cfg: Config, estimator: Callable, n_time: int):
-    """Predicate: does ``regime_diagnostic`` recommend debiasing this sample's
-    estimate? Uses the same kernel/n_time the sampler will later receive."""
-    if not cfg.screen:
-        return None
-
-    def passes(x) -> bool:
-        est = estimator(x)
-        diag = regime_diagnostic(est.psd, est.freqs, kernel=est.kernel, n_time=n_time)
-        return diag.debias_recommended
-
-    return passes
+    return np.array([
+        draw_process(cfg, process, length, stream_rng(cfg, tag, i, 0))
+        for i in range(cfg.n_samples)
+    ])
 
 
 # =============================================================================
@@ -476,15 +439,12 @@ def run_welch_simulations(cfg: Config, workers: int) -> None:
         length = m * cfg.segment_length
         for process in ("ar4", "matern"):
             base = _sim_dir(cfg, process, "welch_sim")
-            screen = debias_screen(
-                cfg, lambda x, m=m: welch_estimate(cfg, x, m), cfg.segment_length
-            )
-            # One stream tag across segment counts: unscreened samples at
-            # different m are prefix-nested truncations of shared realisations
-            # (see draw_process), matching the original study's long-draw cache.
+            # One stream tag across segment counts: samples at different m are
+            # prefix-nested truncations of shared realisations (see
+            # draw_process), matching the original study's long-draw cache.
             samples = load_or_compute(
                 os.path.join(base, "samples", f"{m}.npy"),
-                build_samples, cfg, process, length, f"welch/{process}", screen,
+                build_samples, cfg, process, length, f"welch/{process}",
             )
             first, psds = load_or_stack(
                 os.path.join(base, "welch", f"{m}.npy"),
@@ -527,8 +487,8 @@ def _quad_variants(cfg: Config):
 
 
 def quad_samples_path(cfg: Config, base: str, name: str, nw: int) -> str:
-    """Debias arm: per-setting samples (each screened against its own
-    estimator). Smooth arm: one shared file for both estimators."""
+    """Debias arm: per-setting samples, one file per estimator. Smooth arm:
+    one shared file for both estimators."""
     if cfg.arm == "debias":
         return os.path.join(base, "samples", f"{name}_NW{nw}.npy")
     return os.path.join(base, "samples", "samples.npy")
@@ -544,13 +504,11 @@ def run_quad_simulations(cfg: Config, workers: int) -> None:
             for name, make_estimator, est_dir, debias_dir in _quad_variants(cfg):
                 setting = lag if name == "lag" else nw
                 estimator = make_estimator(setting)
-                screen = debias_screen(cfg, estimator, cfg.n_time_quad)
                 samples = load_or_compute(
                     quad_samples_path(cfg, base, name, nw),
                     build_samples, cfg, process, cfg.n_time_quad,
                     f"quad/{process}/{name}_NW{nw}" if cfg.arm == "debias"
                     else f"quad/{process}/shared",
-                    screen,
                 )
 
                 first, psds = load_or_stack(
@@ -607,9 +565,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("arm", choices=("debias", "smooth"),
                         help="which arm of the study to generate")
-    parser.add_argument("--screen", action="store_true",
-                        help="debias arm only: redraw each realisation until "
-                             "regime_diagnostic recommends debiasing its estimate")
     parser.add_argument("--n-samples", type=int, default=None)
     parser.add_argument("--n-iterations", type=int, default=None)
     parser.add_argument("--warmup", type=int, default=None)
@@ -620,11 +575,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
 
-    if args.screen and args.arm != "debias":
-        parser.error("--screen only applies to the debias arm")
-
     cfg = Config(**(DEBIAS_CONFIG if args.arm == "debias" else SMOOTH_CONFIG))
-    cfg.screen = args.screen
     for name in ("n_samples", "n_iterations", "warmup", "base_path", "seed"):
         value = getattr(args, name)
         if value is not None:

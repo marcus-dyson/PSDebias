@@ -477,6 +477,7 @@ class PSDebias:
         self.mode = mode
         self.freqs = freqs
         self.estimate = estimate
+        self.V =
         self.rng = np.random.default_rng() if rng is None else rng
 
         # One kernel, two regressions. Everything mode-specific is decided
@@ -567,7 +568,6 @@ class PSDebias:
         raise ValueError(
             f"no initial knot configuration with all-positive coefficients found "
             f"in {max_attempts} prior draws — debiasing is likely not appropriate "
-            f"for this estimate; run regime_diagnostic() or use mode='smooth'"
         )
 
     def sample(
@@ -644,8 +644,7 @@ class PSDebias:
         if n_accept == 0:
             warnings.warn(
                 "MCMC chain never accepted a proposal — every stored sample is the "
-                "initial configuration and the results are unreliable. Check "
-                "regime_diagnostic() and consider mode='smooth'.",
+                "initial configuration and the results are unreliable. Check ",
                 RuntimeWarning,
                 stacklevel=2,
             )
@@ -739,34 +738,20 @@ def fit_psd(
     estimate: SpectralEstimate,
     *,
     n_time: int | None = None,
-    mode: str = "auto",
+    mode: str = "debias",
     knot_spacing: int = 4,
     log_knots: bool = False,
     rng: np.random.Generator | None = None,
     **sample_kwargs,
 ) -> FitResult:
-    """One-call PSDebias: pick the regime, sample, return the fit.
+    """One-call PSDebias: build the sampler, sample, return the fit.
 
-    ``mode="auto"`` runs :func:`psdebias.diagnostic.regime_diagnostic` — the
-    bandwidth-matched NNLS-gap rule (does a positive, blur-matched
-    representation fit essentially as well as the best unconstrained one?) —
-    and dispatches to ``"debias"`` or ``"smooth"`` accordingly. The diagnostic
-    chooses its own mesh from the window bandwidth, independent of the
-    sampler's ``knot_spacing``. Requires ``kernel`` and ``n_time`` unless
-    ``mode="smooth"``.
+    ``mode`` is ``"debias"`` or ``"smooth"``. Requires ``kernel`` and
+    ``n_time`` unless ``mode="smooth"``.
     """
-    from psdebias.diagnostic import regime_diagnostic
 
     # take out items
-    freqs, psd, kernel, dof = estimate
-
-    if mode == "auto":
-        if kernel is None or n_time is None:
-            raise ValueError("mode='auto' requires kernel and n_time for the regime diagnostic")
-        diag = regime_diagnostic(
-            psd, freqs, kernel=kernel, n_time=n_time, log_knots=log_knots,
-        )
-        mode = "debias" if diag.debias_recommended else "smooth"
+    freqs, psd, kernel, dof = estimate.freqs, estimate.psd, estimate.kernel, estimate.dof
 
     sampler = PSDebias(
         psd, freqs, mode=mode, kernel=kernel,dof=dof, n_time=n_time,

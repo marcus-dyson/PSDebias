@@ -84,7 +84,7 @@ class TestConditionalDraws:
     def test_moments_for_fixed_configuration(self, welch_ar4):
         # Freeze gamma by proposing no-op flips; the kernel then draws
         # (sigma^2, beta) from the conditional posterior of one configuration.
-        freqs, psd, _, _ = welch_ar4
+        freqs, psd, _, _, *_ = welch_ar4
         y = np.log(psd)
         knots, _, halve = knot_grid(freqs, 16)
         falling, rising = half_bases(freqs, knots)
@@ -131,7 +131,7 @@ class TestConditionalDraws:
 
 class TestPSDebias:
     def test_determinism(self, welch_ar4):
-        freqs, psd, kernel, dof = welch_ar4
+        freqs, psd, kernel, dof, *_ = welch_ar4
         kwargs = dict(n_iterations=2000, warmup=500, thin=5, n_beta_draws=5)
         results = []
         for _ in range(2):
@@ -145,7 +145,7 @@ class TestPSDebias:
         np.testing.assert_array_equal(results[0].mean, results[1].mean)
 
     def test_map_estimate_uses_kernel_posterior(self, welch_ar4):
-        freqs, psd, kernel, dof = welch_ar4
+        freqs, psd, kernel, dof, *_ = welch_ar4
         sampler = PSDebias(
             psd, freqs, mode="smooth", dof=dof, knot_spacing=16, rng=np.random.default_rng(2)
         )
@@ -168,7 +168,7 @@ class TestPSDebias:
         assert curve.shape == freqs.shape
 
     def test_debias_mode_positive_coefficients(self, welch_ar4):
-        freqs, psd, kernel, _ = welch_ar4
+        freqs, psd, kernel, _, *_ = welch_ar4
         sampler = PSDebias(
             psd, freqs, mode="debias", kernel=kernel, n_time=512,
             knot_spacing=16, rng=np.random.default_rng(11),
@@ -183,7 +183,7 @@ class TestPSDebias:
             assert np.all(np.isnan(res.betas[i, :, p:]))
 
     def test_store_predictive(self, welch_ar4):
-        freqs, psd, _, dof = welch_ar4
+        freqs, psd, _, dof, *_ = welch_ar4
         sampler = PSDebias(
             psd, freqs, mode="smooth", dof=dof, knot_spacing=16, rng=np.random.default_rng(5)
         )
@@ -199,7 +199,7 @@ class TestPSDebias:
         np.testing.assert_allclose(geo_mean, res.mean, rtol=1e-10)
 
     def test_initial_gamma_override(self, welch_ar4):
-        freqs, psd, _, dof = welch_ar4
+        freqs, psd, _, dof, *_ = welch_ar4
         sampler = PSDebias(
             psd, freqs, mode="smooth", dof=dof, knot_spacing=16, rng=np.random.default_rng(9)
         )
@@ -215,7 +215,7 @@ class TestPSDebias:
             )
 
     def test_input_validation(self, welch_ar4):
-        freqs, psd, kernel, _ = welch_ar4
+        freqs, psd, kernel, _, *_ = welch_ar4
         with pytest.raises(ValueError, match="mode"):
             PSDebias(psd, freqs, mode="banana")
         with pytest.raises(ValueError, match="requires kernel"):
@@ -232,7 +232,7 @@ SUNSPOT_CSV = Path(__file__).parent.parent / "data" / "SN_y_tot_V2.0.csv"
 @pytest.fixture(scope="module")
 def sunspot_sampler():
     x = np.genfromtxt(SUNSPOT_CSV, delimiter=";").T[1]
-    freqs, psd, kernel, _ = multitaper(x, nw=3.5)
+    freqs, psd, kernel, *_ = multitaper(x, nw=3.5)
     return PSDebias(
         psd, freqs, mode="debias", kernel=kernel, n_time=len(x),
         knot_spacing=2, rng=np.random.default_rng(1),
@@ -263,7 +263,7 @@ class TestDebiasInitialization:
 
     def test_prior_init_deterministic_under_seed(self):
         x = np.genfromtxt(SUNSPOT_CSV, delimiter=";").T[1]
-        freqs, psd, kernel, _ = multitaper(x, nw=3.5)
+        freqs, psd, kernel, *_ = multitaper(x, nw=3.5)
         draws = []
         for _ in range(2):
             s = PSDebias(

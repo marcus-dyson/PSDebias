@@ -16,8 +16,7 @@ Two regimes, one machinery:
   regression inverts the blurring, and evaluating the unconvolved bases at the
   fitted coefficients recovers the underlying spectrum.
 
-A data-driven **sign diagnostic** (paper Sec. IV-C) decides which regime is
-warranted before any sampling.
+The regime is chosen by the caller through `mode="debias"` or `mode="smooth"`.
 
 This package is a ground-up rewrite of the original `auto-speccy` research
 code with corrected statistics, stabilized numerics, ~65x lower sampler
@@ -44,14 +43,14 @@ from psdebias import welch, fit_psd, ar_spectrum, sample_ar
 ar_poly = np.array([1.0, -2.7607, 3.8106, -2.6535, 0.9238])  # [1, -phi...]
 x = sample_ar(1, 32 * 1024, ar_poly, rng=np.random.default_rng(0))[0]
 
-# --- any quadratic estimator; note the third output: the bias kernel --------
-freqs, psd, kernel = welch(x, segment_length=1024, n_segments=32, step=1024)
+# --- any quadratic estimator; carries the bias kernel and dof --------------
+est = welch(x, segment_length=1024, n_segments=32, step=1024)
 
 # --- the full PSDebias workflow in one call ---------------------------------
 fit = fit_psd(
-    psd, freqs,
-    kernel=kernel, n_time=1024,   # the estimator's window, for the diagnostic/debias
-    mode="auto",                  # sign diagnostic picks "debias" or "smooth"
+    est,
+    n_time=1024,                  # the estimator's window, for the debiasing
+    mode="debias",                # or "smooth" for the variance-dominant regime
     knot_spacing=4,               # one candidate knot per 4 frequency bins
     rng=np.random.default_rng(1),
     n_iterations=50_000, warmup=30_000,
@@ -59,19 +58,17 @@ fit = fit_psd(
 
 fit.mean          # posterior-mean PSD (always linear scale)
 fit.std           # pointwise posterior std
-fit.mode          # which regime the diagnostic chose
+fit.mode          # the regime it was run in
 fit.expected_knots, fit.acceptance_rate
 ```
 
 Lower-level control:
 
 ```python
-from psdebias import PSDebias, regime_diagnostic
+from psdebias import PSDebias
 
-diag = regime_diagnostic(psd, freqs, kernel=kernel, n_time=1024)
-print(diag.debias_recommended, diag.gap_per_constraint, diag.bandwidth_bins)
-
-sampler = PSDebias(psd, freqs, mode="debias", kernel=kernel, n_time=1024,
+sampler = PSDebias(est.psd, est.freqs, mode="debias", kernel=est.kernel,
+                   dof=est.dof, n_time=1024,
                    knot_spacing=4, rng=np.random.default_rng(2))
 result = sampler.sample(n_iterations=50_000, warmup=30_000, thin=10)
 gamma_map, psd_map = sampler.map_estimate()   # most probable configuration
@@ -83,17 +80,17 @@ Fixed-mesh debiasing (the DWelch/DQuad baselines):
 from psdebias import dwelch_b1
 gamma = np.zeros(len(freqs), dtype=np.int8)
 gamma[::10] = 1                                   # a uniform mesh
-_, debiased = dwelch_b1(psd, freqs, gamma=gamma, kernel=kernel, n_time=1024)
+_, debiased = dwelch_b1(est.psd, est.freqs, gamma=gamma, kernel=est.kernel,
+                        n_time=1024)
 ```
 
 ## API
 
 | symbol | purpose |
 |---|---|
-| `periodogram, welch, lag_window, multitaper` | classical estimators; each returns `SpectralEstimate(freqs, psd, kernel)` where `kernel` is the one-sided bias sequence `h[tau]` the debiasing machinery needs |
-| `fit_psd` | diagnostic + regime dispatch + sampling + posterior summary in one call |
+| `periodogram, welch, lag_window, multitaper` | classical estimators; each returns `SpectralEstimate(freqs, psd, kernel, dof, ...)` where `kernel` is the one-sided bias sequence `h[tau]` the debiasing machinery needs |
+| `fit_psd` | sampling + posterior summary in one call |
 | `PSDebias` | the sampler class (`sample`, `map_estimate`, `design_matrix`) |
-| `regime_diagnostic`, `window_bandwidth` | debias-or-smooth rule (bandwidth-matched NNLS-gap; used by `mode="auto"`) |
 | `dwelch_b0, dwelch_b1` | fixed-knot debiasing (B0 / B1 bases, arbitrary nonuniform knots) |
 | `ar_spectrum, matern_acf, matern_spectrum` | closed-form validation targets |
 | `sample_ar, sample_matern` | seeded process simulators (AR via `lfilter`, Matern via circulant embedding) |
@@ -114,7 +111,7 @@ units afterwards.
 | Algorithm 1 (MH with subset flips, positivity in debias mode) | `sampler._mh_kernel` |
 | Sec. IV-A smoothing (log domain) | `PSDebias(mode="smooth")` |
 | Sec. IV-B debiasing (linear domain, weighted) | `PSDebias(mode="debias")` |
-| Sec. IV-C diagnostic (replaced by the gap rule) | `diagnostic.regime_diagnostic`, `fit_psd(mode="auto")` |
+| Sec. IV-C diagnostic | not implemented; the regime is chosen by the caller's `mode` |
 
 Per-iteration cost is O(N log N)-equivalent: the spectral-window convolutions
 are precomputed once, each MH step reassembles only the design columns whose
@@ -130,9 +127,8 @@ The paper's bias-variance study lives outside the library
 * `scripts/generate_realisations.py {debias,smooth}` — draws AR(4)/Matern
   realisations, runs the classical estimators, the fixed-mesh `dwelch_b0`
   baseline (debias arm) and the adaptive sampler, caching everything under
-  `scripts/realisations/`. `--screen` (debias arm) redraws each realisation
-  until `regime_diagnostic` endorses debiasing its estimate;
-  `--n-samples/--n-iterations/--warmup` shrink it for smoke runs.
+  `scripts/realisations/`. `--n-samples/--n-iterations/--warmup` shrink it for
+  smoke runs.
 * `scripts/wavelet_thresholding.py` — WPM wavelet-thresholding baseline over
   the smoothing-arm realisations.
 * `notebooks/bias-variance.ipynb` — empirical MSE/bias/variance comparison of

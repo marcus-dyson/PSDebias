@@ -50,7 +50,7 @@ def welch_estimate():
     rng = np.random.default_rng(99)
     l, m, s = 256, 30, 128
     x = sample_ar(1, (m - 1) * s + l, PAPER_AR_POLY, rng=rng)[0]
-    freqs, psd, kernel, _ = welch(x, segment_length=l, n_segments=m, step=s)
+    freqs, psd, kernel, *_ = welch(x, segment_length=l, n_segments=m, step=s)
     return freqs, psd, kernel, l
 
 
@@ -109,7 +109,7 @@ class TestDwelchB0:
         rng = np.random.default_rng(5)
         l, m, s = 128, 200, 64
         x = rng.standard_normal((m - 1) * s + l)
-        freqs, psd, kernel, _ = welch(x, segment_length=l, n_segments=m, step=s)
+        freqs, psd, kernel, *_ = welch(x, segment_length=l, n_segments=m, step=s)
         gamma = np.zeros(len(freqs), dtype=np.int8)
         gamma[::10] = 1
         _, debiased = dwelch_b0(psd, freqs, gamma=gamma, kernel=kernel, n_time=l)
