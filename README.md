@@ -73,16 +73,21 @@ gamma = np.zeros(len(est.freqs), dtype=np.int8)
 gamma[::10] = 1                                   # a uniform mesh
 debiased = dquad(est.psd, est.freqs, gamma=gamma, kernel=est.kernel,
                  n_time=1024)
+
+# ...or account for the correlation between neighbouring bins (DQuad Eq. 12).
+# A no-op for rectangular tapers, where the bins are exactly uncorrelated.
+debiased = dquad(est.psd, est.freqs, gamma=gamma, kernel=est.kernel,
+                 n_time=1024, corr=est.corr)
 ```
 
 ## API
 
 | symbol | purpose |
 |---|---|
-| `periodogram, welch, lag_window, multitaper` | classical estimators; each returns `SpectralEstimate(freqs, psd, kernel)` where `kernel` is the one-sided bias sequence `h[tau]` the debiasing machinery needs |
+| `periodogram, welch, lag_window, multitaper` | classical estimators; each returns `SpectralEstimate(freqs, psd, kernel, corr)` where `kernel` is the one-sided bias sequence `h[tau]` the debiasing machinery needs and `corr` the one-sided frequency-correlation sequence `rho[d]` (`.corr_matrix()` for the dense form) |
 | `fit_psd` | sampling + posterior summary in one call |
 | `PSDebias` | the sampler class (`sample`, `map_estimate`, `design_matrix`) |
-| `dquad` | fixed-knot debiasing on B0 bases, arbitrary nonuniform knots (the DWelch/DQuad baseline) |
+| `dquad` | fixed-knot debiasing on B0 bases, arbitrary nonuniform knots (the DWelch/DQuad baseline); pass `corr=` for the generalised least squares of DQuad Eq. 12 |
 | `ar_spectrum, matern_acf, matern_spectrum` | closed-form validation targets |
 | `sample_ar, sample_matern` | seeded process simulators (AR via `lfilter`, Matern via circulant embedding) |
 

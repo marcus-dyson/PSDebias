@@ -8,11 +8,18 @@ at the fitted coefficients to obtain the debiased spectrum.
 NNLS enforces coefficient positivity directly here: a fixed mesh has no MH
 sampler rejecting negative-coefficient configurations, so the constraint moves
 into the solver instead.
+
+Passing ``corr`` selects a different fit entirely -- DQuad Eq. 12, done as the
+paper does it: closed-form generalised least squares on the full two-sided
+Fourier grid, with the correlation matrix circulant and its inverse applied by
+FFT. That path is *unconstrained*, because Eq. 12's solution is analytic; the
+positivity constraint above applies only to the default path.
 """
 
 from __future__ import annotations
 
 import numpy as np
+import scipy.fft
 import scipy.optimize
 from numpy import typing as npt
 
@@ -30,6 +37,7 @@ def _check_inputs(estimate, freqs, gamma, kernel, n_time):
         raise ValueError("estimate must be strictly positive (it is used as an inverse weight)")
     if len(kernel) != n_time:
         raise ValueError(f"kernel length {len(kernel)} != n_time {n_time}")
+
     return estimate, freqs, gamma, kernel
 
 
@@ -46,13 +54,28 @@ def dquad(
     ``gamma`` indicates active interior knots among the candidates
     ``[0, freqs..., 0.5]`` (length ``len(freqs)``); ``kernel`` is the
     estimator's one-sided bias sequence (length ``n_time``).
+
+    ``corr`` is the estimator's one-sided frequency-correlation sequence
+    (``SpectralEstimate.corr``). Supplying it solves DQuad Eq. 12 in closed form
+    on the two-sided grid instead of the diagonally weighted NNLS problem;
+    omitting it leaves the previous behaviour untouched.
+
+    The Eq. 12 path needs the DC and Nyquist bins in order to mirror onto the
+    two-sided grid, so pass estimates built with ``drop_endpoints=False``. Its
+    ``gamma`` therefore runs over ``freqs[1:-1]``, the interior candidates,
+    since ``freqs[0] = 0`` and ``freqs[-1] = 1/2`` already sit on the ghosts.
     """
-    estimate, freqs, gamma, kernel = _check_inputs(estimate, freqs, gamma, kernel, n_time)
-    knots = np.concatenate(([0.0], freqs, [0.5]))
-    weights = estimate**-1
+    estimate, freqs, gamma, kernel = _check_inputs(
+        estimate, freqs, gamma, kernel, n_time
+    )
+    # Two accepted layouts, as in util.freq_slice: the endpoint-dropped grid
+    # (ghost knots off-grid, added here) or the full one-sided grid (freqs[0] and
+    # freqs[-1] ARE the ghosts, so the candidate list is freqs itself).
+    knots = freqs if freqs[0] == 0.0 else np.concatenate(([0.0], freqs, [0.5]))
+    biased = splines.basis_b0_biased(freqs, knots, gamma, n_time, kernel)
 
-    x_biased = splines.basis_b0_biased(freqs, knots, gamma, n_time, kernel) * weights[:, None]
+    x_biased = biased * (estimate**-1)[:, None]
     beta, _ = scipy.optimize.nnls(x_biased, np.ones(len(estimate)))
-    x_out = splines.basis_b0(freqs, knots, gamma)
-    return x_out @ beta
 
+    output = splines.basis_b0(freqs, knots, gamma)
+    return output @ beta

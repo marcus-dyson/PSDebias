@@ -310,3 +310,168 @@ fixed seed is now a test.
 * Real test suite (`tests/`, 104+ tests; `pytest` runs fast tests by default,
   `pytest -m ""` includes the slow end-to-end studies). The original's README
   advertised a `tests/` directory and an `IMPROVEMENTS.md` that did not exist.
+
+## 8. Frequency-correlation matrix restored, and `dquad` gains DQuad Eq. 12
+
+The original's correlation-matrix parameters were *accepted and ignored*, and
+§5b removed them. They are now back, computed for real, and actually used.
+
+### `SpectralEstimate` gains a fourth field, `corr`
+
+The one-sided frequency-correlation sequence `rho[d]` between spectral estimates
+`d` bins apart, alongside `freqs`, `psd` and `kernel`. It is DQuad Eq. 8 /
+spectral-covariance note Eq. 10, specialised per estimator:
+
+| estimator | `rho` | source |
+|---|---|---|
+| `periodogram` | `abs(rfft(taper**2))**2` | `H_2(eta)`, note Part I |
+| `welch` | `sum_d (2 - delta_d0)(1 - d/M) abs(rfft(p_d))**2` | note Eq. 31 |
+| `lag_window` | `psd_from_acf(kernel * win)` | corrected, see below |
+| `multitaper` | `sum_{j,k} abs(rfft(h_j h_k))**2` | note Eq. 23 |
+
+all normalised to `rho[0] = 1`. Stored as a sequence, not a matrix: `rho`
+depends only on separation, so the length-g form is lossless while the dense one
+is 8 MB at g = 1023 and 2 GB for a multitaper on a 32k-point series.
+`.corr_matrix()` builds the dense form on demand. The lag-window case reuses
+`util.psd_from_acf` verbatim; the rest are one batched `rfft` of short product
+sequences. The general Eq. 8 route would need an `O(n^3)` eigendecomposition of
+`Q` for a lag-window (`K = n` there, paper sec. 3.2), so the note's
+per-estimator closed forms are what make this cheap.
+
+### A third corrected defect: the lag-window `rho` (2026-08-24)
+
+`lag_window` originally computed `rho` as `psd_from_acf(kernel**2)`, i.e. the
+transform of `w^2[tau] (1 - tau/n)^2`. That is wrong by one triangular factor.
+
+The estimator is the quadratic form `A[s, t] = w[|s-t|] cos(2 pi eta (s-t)) / n`
+built from the **raw** window — the biased ACF's `(1 - |tau|/n)` taper is not in
+`A` at all. It appears in the moments only because `n - |tau|` pairs `(s, t)`
+sit on each diagonal: once in `E[I]` (which is what `kernel` is, and `kernel` is
+unchanged), and once more in
+
+```
+Cov(I_i, I_j) = 2 tr(A_i A_j) = ( D(i - j) + D(i + j) ) / 2,
+D(delta) = (1/n^2) sum_tau (n - |tau|) w^2[tau] cos(2 pi delta tau / n),
+```
+
+so the difference term carries `w^2 (1 - |tau|/n)` — first power. The corrected
+code forms exactly that as `kernel * win`.
+
+Error size, `n = 64`, max deviation of the full sequence from `D`:
+
+| window | lag = 4 | lag = 8 | lag = 16 |
+|---|---|---|---|
+| bartlett | 8.8e-3 | 1.6e-2 | 3.2e-2 |
+| parzen | 6.7e-3 | 1.1e-2 | 2.1e-2 |
+
+With `kernel * win` the deviation is `<= 4.4e-16` in every case. The error is
+`O(lag/n)`, which is why `test_lag_window_bandwidth_closed_form` (`lag = n/32`,
+`rtol = 2e-2`) could not see it, and why it reaches a few percent at the
+`lag = n/10` default.
+
+This also means the code no longer follows the companion note's Eq. 17, which is
+`sum_tau w^2[tau] cos(...)` with no triangular factor at all — the asymptotic
+`lag/n -> 0` limit of the above. The exact finite-sample form is used instead;
+the old source comment quoted Eq. 17 while the code did something third.
+
+Only `lag_window(...).corr` changes. `periodogram`, `welch` and `multitaper` are
+bit-identical, and were verified to be exactly the difference term of
+`2 tr(A_i A_j)` (to 1e-15 relative) by the same oracle.
+
+### The oracle that found it
+
+`tests/conftest.py` gained `quadratic_form_{periodogram,welch,multitaper,
+lag_window}` and `exact_bin_covariance`. Every estimator here is quadratic in
+the data, so for Gaussian `x` Isserlis gives the covariance of two bins exactly,
+with no asymptotics and no Monte Carlo. The new
+`TestCorrelation::test_*_matches_exact_quadratic_form` assert
+
+```
+tr(A_i A_j) == c ( U(|i - j|) + U(i + j) )
+```
+
+for all four estimators, `U` being `rho`'s even `n`-periodic extension. The
+pre-existing `reference_corr_*` oracles are independent implementations of the
+*same* DQuad Eq. 8, so they pin the algebra but assume the formula; these pin
+the formula against the definition of a correlation.
+
+The `U(i + j)` term is what `toeplitz(rho)` drops — it is what makes the true
+correlation matrix non-Toeplitz. It is negligible mid-band and material only
+when both bins crowd DC or Nyquist;
+`test_sum_frequency_term_is_the_toeplitz_error` pins both halves of that.
+
+### `dquad` gains `corr=`, which selects DQuad Eq. 12
+
+Implemented as the paper specifies it, not adapted:
+
+* **Full two-sided Fourier grid.** `w_k = 2 pi k / n`, `k = -floor(n/2) ..
+  ceil(n/2) - 1`. Reached by re-indexing the one-sided arrays, since both the
+  estimate and the (real, even) bases take the same value at `+f` and `-f`.
+* **W circulant, inverted by FFT** — the paper's sec. 3.2 `O(n log n)` claim.
+  `W^-1` is never formed as a matrix.
+* **Closed form, unconstrained.** `(X' W^-1 X) theta = X' W^-1 1`, solved
+  directly. No NNLS on this path.
+
+`Gamma^-1` was already the `1/estimate` weighting, so it is only `W^-1` that is
+new. **`corr=None` is the default and reproduces the previous output
+bit-for-bit** (verified by `assert_array_equal` on a fixed-seed fit); NNLS and
+the positivity constraint still govern that path.
+
+Because the Eq. 12 path mirrors onto the two-sided grid it needs the DC and
+Nyquist bins, so it requires estimates built with `drop_endpoints=False` and
+raises otherwise — those bins cannot be reconstructed once dropped. Its `gamma`
+accordingly runs over `freqs[1:-1]`, since `freqs[0] = 0` and `freqs[-1] = 1/2`
+already sit on the ghost knots.
+
+One note on the paper's wording: it states `V` is circulant, but `V = Gamma W
+Gamma` with `Gamma_ii = I(w_i)` varying is a diagonal-scaled circulant. The
+algorithm is unaffected — `V^-1 = Gamma^-1 W^-1 Gamma^-1` and the `Gamma`
+factors fold into the design and response — but the FFT-inverted object is `W`.
+
+### A defect the full grid exposed
+
+`splines.b0_box` returns 1/2 exactly on a box boundary, which is what makes two
+boxes sharing an interior knot sum to 1 there. On the two-sided grid the ghost
+knots **are** grid points, and at `f = 0` and `f = 1/2` no neighbouring box
+supplies the other half — so the debiased spectrum came out at exactly half
+value in those two bins. Corrected in `dquad`, and only for the output design:
+`basis_b0_biased` goes through `acf_box` and `psd_from_acf`, which evaluate no
+boundaries. This is the B0 counterpart of the `EMPTY_IDX` / `halve_idx` split
+the sampler keeps between its two designs. Pinned by
+`test_dwelch.py::TestDquadGLS::test_flat_spectrum_recovered_including_endpoints`.
+
+### Where Eq. 12 holds up, and where it does not
+
+Median log-MSE over 6 AR(4) realisations, B0 mesh every 16 bins (4 for Welch),
+against the diagonally weighted NNLS fit:
+
+| estimator | `lam_min(W)` | cond | WLS | Eq. 12 | negative bins |
+|---|---|---|---|---|---|
+| welch, rect, 50%, `L=512` | 6.7e-1 | 2.0 | 6.455 | 6.612 | 0 |
+| welch, Hann, 50%, `L=512` | 1.6e-1 | 13 | 0.041 | 0.054 | 0 |
+| multitaper `nw=4 K=8` | 7.9e-3 | 1.0e3 | 43.72 | 198.7 | 326 of 1023 |
+| lag-window, Bartlett `lag=n/8` | **-1.8e-15** | 7e15 | 4.908 | **undefined** | — |
+
+Welch — the paper's own primary case — is well conditioned and behaves. The
+other two are the limits of Eq. 12 as written:
+
+* **Multitaper solves but goes negative** across a third of the band. Eq. 12 is
+  unconstrained, so this is the estimator behaving as specified, not a failure.
+  Pinned by `test_unconstrained_solution_may_go_negative`.
+* **Lag-window is singular.** Eq. 12 assumes W positive definite; a Bartlett lag
+  window's correlation is wide enough that the circulant's smallest eigenvalue
+  lands at -1.8e-15, and dividing by it makes the closed form NaN. `dquad` now
+  raises with the eigenvalues named rather than returning NaN. That guard is a
+  diagnostic and changes no result Eq. 12 actually defines.
+
+The paper's own simulation avoids both: a modified Daniell of width `M = 2^5` at
+`n = 2^14` is far narrower than the grid, and `S = O(n^(1/3))` caps the bases at
+~25. Reproducing the paper's settings rather than this package's defaults is the
+way to see Eq. 12 at its best.
+
+Rectangular tapers additionally give `W = I` exactly — `h_t^2 = 1/n` makes `H_2`
+the Dirichlet kernel, which vanishes at every nonzero Fourier-grid separation.
+`dquad` in `scripts/generate_realisations.py` is deliberately left on the
+diagonal weighting so the cached `scripts/realisations/` tree stays comparable.
+
+`PSDebias` is untouched: the sampler still uses the diagonal weighting.

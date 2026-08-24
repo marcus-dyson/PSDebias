@@ -4,8 +4,10 @@ Every estimator returns a :class:`SpectralEstimate` named tuple
 ``(freqs, psd, kernel)`` where ``kernel`` is the one-sided bias sequence
 ``h[tau]`` (the effective lag window / taper autocorrelation) that
 ``psdebias.sampler``/``psdebias.dwelch`` need to build spectral-window-convolved
-bases. All four estimators apply consistent ``1/fs`` density scaling (the
-original package omitted it for the periodogram only).
+bases, and ``corr`` is the one-sided frequency-correlation sequence ``rho[d]``
+that ``psdebias.dwelch`` needs for the generalised least squares of DQuad Eq. 12.
+All four estimators apply consistent ``1/fs`` density scaling (the original
+package omitted it for the periodogram only).
 """
 
 from __future__ import annotations
@@ -14,19 +16,34 @@ from typing import NamedTuple
 
 import numpy as np
 import scipy.fft
+import scipy.linalg
 import scipy.signal
 from numpy import typing as npt
 
-from psdebias.util import segment
+from psdebias.util import psd_from_acf, segment
 
 
 class SpectralEstimate(NamedTuple):
-    """A spectral estimate plus the bias description the debiasing needs:
-    ``kernel`` is the estimator's one-sided bias sequence ``h[tau]``."""
+    """A spectral estimate plus the two descriptions of the estimator's design
+    that the debiasing needs: ``kernel`` is the one-sided bias sequence
+    ``h[tau]``, ``corr`` the one-sided frequency-correlation sequence
+    ``rho[d]`` between estimates ``d`` bins apart."""
 
     freqs: npt.NDArray[np.float64]
     psd: npt.NDArray[np.float64]
     kernel: npt.NDArray[np.float64]
+    corr: npt.NDArray[np.float64]
+
+    def corr_matrix(self) -> npt.NDArray[np.float64]:
+        """Dense correlation matrix ``W[i, j] = rho(|i - j|)``, shape (g, g).
+
+        The paper's Eq. 12 weight matrix. It is built on demand rather than
+        stored: ``rho`` depends only on the separation, so the length-g sequence
+        is lossless, while the dense form is 8 MB at g = 1023 and 2 GB for a
+        multitaper on a 32k-point series -- and would be rebuilt on every
+        estimator call.
+        """
+        return scipy.linalg.toeplitz(self.corr)
 
 
 def _unit_taper(taper: npt.NDArray[np.float64] | None, n: int) -> npt.NDArray[np.float64]:
@@ -49,6 +66,31 @@ def _taper_kernel(taper: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
     return np.correlate(taper, taper, mode="full")[n - 1 :]
 
 
+def _unit_corr(rho: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
+    """Normalize a correlation sequence to ``rho[0] = 1``.
+
+    DQuad Eq. 8 scales by ``M = 1 / sum_k d_k^2``, which is only an
+    approximation of the variance reduction: it ignores the covariance between
+    overlapping Welch blocks, so Eq. 8 is not exactly unit at ``eta = 0`` there.
+    Dividing by the DC value is what makes W an actual correlation matrix (and
+    is what the spectral-covariance note's Eq. 31 does explicitly).
+    """
+    return rho / rho[0]
+
+
+def _taper_corr(taper: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
+    """Correlation sequence of a single-taper estimator: ``|H_2(eta)|^2``.
+
+    DQuad Eq. 8 with K = 1, d_0 = 1: the quadratic form is the rank-one outer
+    product of the taper with itself, so the only taper-product sequence is
+    ``h_t^2`` and ``Gamma(eta)`` is its Fourier transform. For a rectangular
+    taper ``h_t^2 = 1/n`` is constant, making H_2 the Dirichlet kernel, which is
+    exactly zero at every nonzero Fourier-grid separation -- rectangular-taper
+    bins are uncorrelated and the Eq. 12 GLS collapses to plain 1/I weighting.
+    """
+    return _unit_corr(np.abs(scipy.fft.rfft(taper**2)) ** 2)
+
+
 def periodogram(
     x: npt.NDArray[np.float64],
     *,
@@ -68,7 +110,11 @@ def periodogram(
     # any nonzero mean), and the sampler's weighted regression assumes the
     # homogeneous interior bins.
     sl = slice(1, -1) if drop_endpoints else slice(None)
-    return SpectralEstimate(freqs[sl], psd[sl], kernel)
+    # rho indexes bin SEPARATION, not position, so the leading len(freqs[sl])
+    # entries cover every separation the retained grid can produce regardless of
+    # which bins were dropped.
+    corr = _taper_corr(taper)[: len(freqs[sl])]
+    return SpectralEstimate(freqs[sl], psd[sl], kernel, corr)
 
 
 def welch(
@@ -93,7 +139,40 @@ def welch(
     psd = np.mean(np.abs(scipy.fft.rfft(segments * taper, axis=1)) ** 2, axis=0) / fs
     kernel = _taper_kernel(taper)
     sl = slice(1, -1) if drop_endpoints else slice(None)
-    return SpectralEstimate(freqs[sl], psd[sl], kernel)
+    corr = _welch_corr(taper, n_segments, step)[: len(freqs[sl])]
+    return SpectralEstimate(freqs[sl], psd[sl], kernel, corr)
+
+
+def _welch_corr(
+    taper: npt.NDArray[np.float64], n_segments: int, step: int
+) -> npt.NDArray[np.float64]:
+    """Welch's correlation sequence (note Eq. 31), on the segment-length grid.
+
+    DQuad Eq. 8 for Welch takes d_m = 1/M over full-length tapers h^m: the
+    segment taper zero-padded to offset m*step. The (m, m') cross term is then
+    sum_t h^m_t h^m'_t e^{-i eta t}, which under u = t - m*step factors into
+    exp(-i eta m step) * Psi_{m-m'}(eta): the block-index phase cancels inside
+    the modulus, so |Gamma_mm'| depends on the pair only through d = m - m'.
+    Counting the M - |d| pairs at each lag collapses the M^2 double sum to the
+    single sum below, which is why this costs O(L/step) transforms of length L
+    instead of O(M^2) of length n. tests/conftest.py::reference_corr_welch does
+    the uncollapsed double sum, which is what pins this step.
+
+    Psi_d vanishes once d*step >= L (the shifted blocks stop overlapping), so
+    the loop stops there rather than running to M.
+    """
+    seg_len = len(taper)
+    rho = np.zeros(seg_len // 2 + 1)
+    for d in range(n_segments):
+        overlap = seg_len - d * step
+        if overlap <= 0:
+            break
+        product = np.zeros(seg_len)
+        product[:overlap] = taper[:overlap] * taper[d * step :]
+        # (2 - delta_d0) folds in the mirrored lag -d, |Psi_-d| = |Psi_d|.
+        weight = (2.0 if d else 1.0) * (1.0 - d / n_segments)
+        rho += weight * np.abs(scipy.fft.rfft(product)) ** 2
+    return _unit_corr(rho)
 
 
 def lag_window(
@@ -148,7 +227,24 @@ def lag_window(
 
     freqs = scipy.fft.rfftfreq(n, d=1.0 / fs)
     sl = slice(1, -1) if drop_endpoints else slice(None)
-    return SpectralEstimate(freqs[sl], psd[sl], kernel)
+    # rho^(LW)(eta) ∝ sum_tau w^2[tau] (1 - |tau|/n) cos(2 pi eta tau): the
+    # transform of the squared lag window carrying ONE triangular factor, which
+    # is the fold-and-rfft psd_from_acf already performs for the bases. (The
+    # general Eq. 8 route would instead need an O(n^3) eigendecomposition of Q,
+    # which for a lag-window is full rank.)
+    #
+    # Why one factor and not two. The estimator is the quadratic form
+    # A[s, t] = w[|s-t|] cos(2 pi eta (s-t)) / n -- the RAW window; the biased
+    # ACF's triangular taper is not in A at all, it emerges from there being
+    # n - |tau| pairs on each diagonal. So it enters the mean once (giving
+    # `kernel`) and, via tr(A_i A_j) = sum over diagonals, exactly once again --
+    # not squared. Using kernel**2 here overcounts it and is wrong by O(lag/n)
+    # (~3% at lag = n/4). See docs/CHANGES.md §8; this departs from the note's
+    # Eq. 17, which is the asymptotic form with no triangular factor at all.
+    window_padded = np.zeros(n)
+    window_padded[: lag + 1] = win_one_sided
+    corr = _unit_corr(psd_from_acf(kernel * window_padded))[: len(freqs[sl])]
+    return SpectralEstimate(freqs[sl], psd[sl], kernel, corr)
 
 
 def multitaper(
@@ -175,6 +271,13 @@ def multitaper(
     autos = np.array([np.correlate(t, t, mode="full") for t in tapers])
     kernel = autos.mean(axis=0)[n - 1 :]
 
+    # rho^(mt)(eta) = (1/K) ||H^T E_eta H||_F^2 (note Eq. 23) = DQuad Eq. 8 with
+    # d_k = 1/K, M = K. Entry (j, k) of H^T E_eta H is the Fourier transform of
+    # the elementwise product h_j * h_k, so all K^2 of them come from one
+    # batched rfft rather than a K x K matrix product per frequency.
+    products = (tapers[:, None, :] * tapers[None, :, :]).reshape(-1, n)
+    corr = _unit_corr((np.abs(scipy.fft.rfft(products, axis=1)) ** 2).sum(axis=0))
+
     freqs = scipy.fft.rfftfreq(n, d=1.0 / fs)
     sl = slice(1, -1) if drop_endpoints else slice(None)
-    return SpectralEstimate(freqs[sl], psd[sl], kernel)
+    return SpectralEstimate(freqs[sl], psd[sl], kernel, corr[: len(freqs[sl])])

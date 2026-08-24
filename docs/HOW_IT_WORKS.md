@@ -45,7 +45,7 @@ File map (all under `src/psdebias/`):
 | `util.py` | `psd_from_acf` (lag-domain -> rfft-grid transform, the workhorse), grid helpers |
 | `splines.py` | everything about bases: candidate knots, primitives, closed-form ACFs, design-matrix assembly + incremental update |
 | `sampler.py` | the Numba MH kernel, the `PSDebias` class, `fit_psd` |
-| `dwelch.py` | fixed-mesh debiasing baseline `dquad` (NNLS instead of a sampler) |
+| `dwelch.py` | fixed-mesh debiasing baseline `dquad` (NNLS instead of a sampler; optional GLS via the estimator's correlation sequence) |
 | `analytic.py`, `simulate.py` | closed-form spectra and process simulators for validation |
 
 ## 2. The regression
@@ -319,6 +319,24 @@ Reading order that builds up dependencies naturally:
 | Algorithm 1 | `sampler._mh_kernel` |
 | Sec. IV-B debiasing | `PSDebias` |
 
+The `corr` field and `dquad`'s optional GLS come from a *different* paper —
+Astfalck, Sykulski & Cripps, *Bias correction of quadratic spectral estimators*
+(arXiv:2410.12386), whose equation numbering is unrelated to the table above:
+
+| DQuad paper | code |
+|---|---|
+| Eq. 7 (effective sample size `zeta`) | truncation rank in `dwelch._whiten` |
+| Eq. 8 (`R(eta)`, the correlation function) | `estimators._taper_corr`, `_welch_corr`, and the `rho` blocks in `lag_window`/`multitaper` |
+| Eq. 9 (resolution bandwidth) | oracle in `tests/conftest.py::reference_bandwidth_multitaper` |
+| Eq. 12 (GLS with `V = Gamma W Gamma`) | `dquad(..., corr=...)` |
+
+The per-estimator closed forms for `R(eta)` are taken from the companion note
+*Frequency-Domain Correlation Structure of Nonparametric Spectral Density
+Estimators* (its Eq. 17, 23, 31), because the DQuad paper's general Eq. 8 would
+need an `O(n^3)` eigendecomposition of `Q` for a lag-window. The lag-window case
+deliberately departs from the note's asymptotic Eq. 17 in favour of the exact
+finite-sample sequence — see CHANGES.md §8.
+
 ## 8. Where the tests pin behavior
 
 Use these as the safety net when modifying code — each one guards a specific
@@ -338,6 +356,14 @@ invariant:
 | `test_sampler.py::test_map_estimate_uses_kernel_posterior` | MAP selector and chain share one posterior |
 | `test_sampler.py::TestDebiasInitialization` | debias init lands inside the positivity support (sunspot data) |
 | `test_dwelch.py::TestDquad` | fixed-mesh `dquad` recovers a flat spectrum and beats raw Welch in the biased tail |
+| `test_estimators.py::TestCorrelation::test_*_oracle` | `rho` == brute-force `R(eta)` double sums (no FFT shortcuts, no shared code) |
+| `test_estimators.py::TestCorrelation::test_*_bandwidth_*` | correlation area == published resolution bandwidths (DQuad Eq. 9; `1.5/m`, `1.854/m`) |
+| `test_estimators.py::TestCorrelation::test_rectangular_periodogram_is_identity` | rectangular tapers decorrelate the Fourier grid exactly |
+| `test_estimators.py::TestCorrelation::test_*_matches_exact_quadratic_form` | `rho` == the exact finite-sample covariance `2 tr(A_i A_j)` (Isserlis), all four estimators |
+| `test_estimators.py::TestCorrelation::test_sum_frequency_term_is_the_toeplitz_error` | the one approximation `toeplitz(rho)` makes: the dropped `U(i + j)` term |
+| `test_dwelch.py::TestDquadGLS::test_identity_corr_matches_wls` | `W = I` collapses the GLS path onto the diagonal one |
+| `test_dwelch.py::TestDquadGLS::test_rank_truncation_at_effective_sample_size` | GLS truncated at `zeta`, not at machine precision (see CHANGES.md §8) |
+| `test_dwelch.py::test_gls_beats_wls_multitaper` (slow) | modelling the correlation pays where `W` is well conditioned |
 | `test_end_to_end.py` (slow) | MSE improvement vs raw estimators on analytic truth; sunspot chain mixes |
 
 ## 9. The bias-variance study (scripts and notebook)

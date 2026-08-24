@@ -505,7 +505,8 @@ def _warmup_numba() -> None:
         tmp.n_iterations, tmp.warmup, tmp.thin, tmp.n_beta_draws = 2, 1, 1, 2
         taper = np.ones(n) / np.sqrt(n)
         kernel = np.correlate(taper, taper, mode="full")[n - 1:]
-        est = SpectralEstimate(freqs, np.ones(len(freqs)) + 0.1, kernel)
+        corr = np.zeros(len(freqs)); corr[0] = 1.0  # value irrelevant; warmup only
+        est = SpectralEstimate(freqs, np.ones(len(freqs)) + 0.1, kernel, corr)
         run_adaptive(tmp, est, n_time=n, n_series=n, knot_spacing=4,
                      rng=np.random.default_rng(0))
     except Exception:  # warmup is an optimization, never fatal
