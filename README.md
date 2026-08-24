@@ -1,28 +1,22 @@
-# psdebias — Adaptive Smoothing of Quadratic Spectral Estimators
+# psdebias — Adaptive Debiasing of Quadratic Spectral Estimators
 
 `psdebias` implements **PSDebias** (Dyson, Astfalck, Cripps & Stemler,
 *"Adaptive Smoothing of Quadratic Spectral Estimators"*): a Bayesian adaptive
-smoothing framework for the general class of quadratic spectral estimators —
+debiasing framework for the general class of quadratic spectral estimators —
 periodogram, Welch, multitaper and lag-window — in which the number, location
 and width of B1-spline bases are learned from the data by Metropolis-Hastings
 over a latent binary knot vector.
 
-Two regimes, one machinery:
-
-* **Variance-dominant** estimates are *smoothed* on the log scale, where their
-  variance is approximately constant.
-* **Bias-dominant** estimates are *debiased* on the linear scale: the spline
-  bases are convolved with the estimator's known spectral window, the
-  regression inverts the blurring, and evaluating the unconvolved bases at the
-  fitted coefficients recovers the underlying spectrum.
-
-The regime is chosen by the caller through `mode="debias"` or `mode="smooth"`.
+Bias-dominant estimates are *debiased* on the linear scale: the spline bases
+are convolved with the estimator's known spectral window, the regression
+inverts the blurring, and evaluating the unconvolved bases at the fitted
+coefficients recovers the underlying spectrum.
 
 This package is a ground-up rewrite of the original `auto-speccy` research
 code with corrected statistics, stabilized numerics, ~65x lower sampler
-memory, and a full test suite. **See [CHANGES.md](CHANGES.md) for every
-difference against the original, and [HOW_IT_WORKS.md](HOW_IT_WORKS.md) for a
-guided tour of how the implementation works.**
+memory, and a full test suite. **See [CHANGES.md](docs/CHANGES.md) for every
+difference against the original, and [HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md)
+for a guided tour of how the implementation works.**
 
 ## Installation
 
@@ -43,22 +37,20 @@ from psdebias import welch, fit_psd, ar_spectrum, sample_ar
 ar_poly = np.array([1.0, -2.7607, 3.8106, -2.6535, 0.9238])  # [1, -phi...]
 x = sample_ar(1, 32 * 1024, ar_poly, rng=np.random.default_rng(0))[0]
 
-# --- any quadratic estimator; carries the bias kernel and dof --------------
+# --- any quadratic estimator; carries the bias kernel ------------------------
 est = welch(x, segment_length=1024, n_segments=32, step=1024)
 
 # --- the full PSDebias workflow in one call ---------------------------------
 fit = fit_psd(
     est,
     n_time=1024,                  # the estimator's window, for the debiasing
-    mode="debias",                # or "smooth" for the variance-dominant regime
     knot_spacing=4,               # one candidate knot per 4 frequency bins
     rng=np.random.default_rng(1),
     n_iterations=50_000, warmup=30_000,
 )
 
-fit.mean          # posterior-mean PSD (always linear scale)
+fit.mean          # posterior-mean PSD (linear scale)
 fit.std           # pointwise posterior std
-fit.mode          # the regime it was run in
 fit.expected_knots, fit.acceptance_rate
 ```
 
@@ -67,8 +59,7 @@ Lower-level control:
 ```python
 from psdebias import PSDebias
 
-sampler = PSDebias(est.psd, est.freqs, mode="debias", kernel=est.kernel,
-                   dof=est.dof, n_time=1024,
+sampler = PSDebias(est.psd, est.freqs, kernel=est.kernel, n_time=1024,
                    knot_spacing=4, rng=np.random.default_rng(2))
 result = sampler.sample(n_iterations=50_000, warmup=30_000, thin=10)
 gamma_map, psd_map = sampler.map_estimate()   # most probable configuration
@@ -77,41 +68,39 @@ gamma_map, psd_map = sampler.map_estimate()   # most probable configuration
 Fixed-mesh debiasing (the DWelch/DQuad baselines):
 
 ```python
-from psdebias import dwelch_b1
-gamma = np.zeros(len(freqs), dtype=np.int8)
+from psdebias import dquad
+gamma = np.zeros(len(est.freqs), dtype=np.int8)
 gamma[::10] = 1                                   # a uniform mesh
-_, debiased = dwelch_b1(est.psd, est.freqs, gamma=gamma, kernel=est.kernel,
-                        n_time=1024)
+debiased = dquad(est.psd, est.freqs, gamma=gamma, kernel=est.kernel,
+                 n_time=1024)
 ```
 
 ## API
 
 | symbol | purpose |
 |---|---|
-| `periodogram, welch, lag_window, multitaper` | classical estimators; each returns `SpectralEstimate(freqs, psd, kernel, dof, ...)` where `kernel` is the one-sided bias sequence `h[tau]` the debiasing machinery needs |
+| `periodogram, welch, lag_window, multitaper` | classical estimators; each returns `SpectralEstimate(freqs, psd, kernel)` where `kernel` is the one-sided bias sequence `h[tau]` the debiasing machinery needs |
 | `fit_psd` | sampling + posterior summary in one call |
 | `PSDebias` | the sampler class (`sample`, `map_estimate`, `design_matrix`) |
-| `dwelch_b0, dwelch_b1` | fixed-knot debiasing (B0 / B1 bases, arbitrary nonuniform knots) |
+| `dquad` | fixed-knot debiasing on B0 bases, arbitrary nonuniform knots (the DWelch/DQuad baseline) |
 | `ar_spectrum, matern_acf, matern_spectrum` | closed-form validation targets |
 | `sample_ar, sample_matern` | seeded process simulators (AR via `lfilter`, Matern via circulant embedding) |
 
 Work in **normalized frequency** (`fs = 1`, grid strictly inside (0, 0.5) —
-i.e. the endpoint-dropped rfft grid the estimators return): the debias mode's
-closed-form basis ACFs are derived on that grid. Rescale results to physical
-units afterwards.
+i.e. the endpoint-dropped rfft grid the estimators return): the closed-form
+basis ACFs are derived on that grid. Rescale results to physical units
+afterwards.
 
 ## How it works (paper -> code)
 
 | paper | code |
 |---|---|
 | Eq. 3 linear model per configuration `gamma` | `sampler._least_squares` (Cholesky of the Gram matrix) |
+| Eq. 5 debiasing regression (linear domain, weighted by `1/I`) | `PSDebias.__init__` |
 | Eq. 6/7 `B0`/`B1` bases from the latent vector | `splines.assemble_design` / `update_design` |
 | Appendix A: truncated linear primitives, convolution paid once via FFT | `splines.acf_rising/acf_falling` + `half_bases_biased` (one batched `rfft`) |
 | Appendix B: marginal posterior over `gamma`, conjugate `(sigma^2, beta)` draws | `sampler._log_posterior`, `_mh_kernel` |
-| Algorithm 1 (MH with subset flips, positivity in debias mode) | `sampler._mh_kernel` |
-| Sec. IV-A smoothing (log domain) | `PSDebias(mode="smooth")` |
-| Sec. IV-B debiasing (linear domain, weighted) | `PSDebias(mode="debias")` |
-| Sec. IV-C diagnostic | not implemented; the regime is chosen by the caller's `mode` |
+| Algorithm 1 (MH with subset flips, coefficient positivity) | `sampler._mh_kernel` |
 
 Per-iteration cost is O(N log N)-equivalent: the spectral-window convolutions
 are precomputed once, each MH step reassembles only the design columns whose
@@ -121,32 +110,30 @@ single small Cholesky solve.
 ## Reproduction scripts
 
 The paper's bias-variance study lives outside the library
-(`pip install -e '.[scripts]'` for its extras — `tqdm`, `PyWavelets`,
-`matplotlib`, `scienceplots`):
+(`pip install -e '.[scripts]'` for its extras — `tqdm`, `matplotlib`,
+`scienceplots`):
 
-* `scripts/generate_realisations.py {debias,smooth}` — draws AR(4)/Matern
-  realisations, runs the classical estimators, the fixed-mesh `dwelch_b0`
-  baseline (debias arm) and the adaptive sampler, caching everything under
-  `scripts/realisations/`. `--n-samples/--n-iterations/--warmup` shrink it for
-  smoke runs.
-* `scripts/wavelet_thresholding.py` — WPM wavelet-thresholding baseline over
-  the smoothing-arm realisations.
+* `scripts/generate_realisations.py` — draws AR(4)/Matern realisations, runs
+  the classical estimators, the fixed-mesh `dquad` baseline and the
+  adaptive sampler, caching everything under `scripts/realisations/`.
+  `--n-samples/--n-iterations/--warmup` shrink it for smoke runs.
 * `notebooks/bias-variance.ipynb` — empirical MSE/bias/variance comparison of
   all streams against the closed-form spectra.
 
 ## Testing
 
 ```console
-pytest            # unit tests (~10 s)
-pytest -m ""      # + slow end-to-end AR(4)/Matern studies (~4 min)
+pytest            # unit tests (~2 s)
+pytest -m ""      # + slow end-to-end AR(4)/Matern studies (~5 min)
 ```
 
 Highlights: bit-for-bit equality of incremental vs full design assembly over
 random MCMC-like walks; closed-form basis ACFs vs adaptive quadrature; biased
 bases vs dense numerical convolution with the spectral window; the JIT
 posterior vs an independent scipy reference; conditional-draw moments vs the
-analytic Student-t posterior; determinism under a fixed seed; and end-to-end
-mean-square-error improvement over the raw estimators on analytic spectra.
+analytic Student-t posterior; B1 partition of unity; determinism under a fixed
+seed; and end-to-end mean-square-error improvement over the raw estimators on
+analytic spectra.
 
 ## License
 

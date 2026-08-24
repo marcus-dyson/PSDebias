@@ -4,8 +4,7 @@
 the reference implementation of *"Adaptive Smoothing of Quadratic Spectral
 Estimators"* (Dyson, Astfalck, Cripps & Stemler). The rewrite fixes two
 statistical defects where the code diverged from the paper, replaces the
-numerically fragile linear algebra, cuts sampler memory by ~65x, implements
-the paper's Sec. IV-C diagnostic (previously missing from the library), and
+numerically fragile linear algebra, cuts sampler memory by ~65x, and
 retires all dead or broken code. This document lists every change against the
 original, with file/line references into `auto_speccy` and the behavioral
 consequences.
@@ -23,14 +22,12 @@ oracles inside individual test files).
 | auto-speccy | psdebias | category |
 |---|---|---|
 | `solver.MH` | `sampler.PSDebias` | renamed + fixed |
-| `MH(Biasing=True/False)` | `PSDebias(mode="debias"/"smooth")` | renamed |
+| `MH(Biasing=True)` | `PSDebias` | renamed; the `Biasing=False` smoothing path is gone (sec. 5b) |
 | `MH(Basis_Resolution=, n_ts=, h_conv=)` | `PSDebias(knot_spacing=, n_time=, kernel=)` | renamed |
 | `MH.sample(n_gibbs_steps=, thinning=, api=, bpi=, asig=, bsig=)` | `PSDebias.sample(n_beta_draws=, thin=, a_pi=, b_pi=, a_sigma=, b_sigma=)` | renamed |
 | `MH.get_mode_gamma` + `get_biased_mode_estimate` | `PSDebias.map_estimate` | merged + fixed |
 | `MH.get_estimates` | `FitResult.mean/std/expected_knots` | replaced |
 | `MH.get_{biased,unbiased}_design_matrix` | `PSDebias.design_matrix(gamma, biased=)` | merged |
-| — | `sampler.fit_psd(mode="auto")` | **new** |
-| — | `diagnostic.regime_diagnostic` | **new** (bandwidth-matched NNLS-gap rule) |
 | `solver.posterior` (njit) | `sampler._log_posterior` | fixed |
 | `solver._mcmc_sampling_loop` | `sampler._mh_kernel` | rewritten |
 | `splines.odd_from_even_biased` / `..._unbiased` | `splines.assemble_design(..., halve_idx)` | unified (4 -> 2 fns) |
@@ -41,7 +38,7 @@ oracles inside individual test files).
 | `splines.gen_basis_b0` / `gen_basis_b0_biased` | `splines.basis_b0` / `basis_b0_biased` | rewritten (batched) |
 | — | `splines.knot_grid` | **new** (was inline in `MH.__init__`) |
 | `psd_est.periodogram/welch/lag_window/multitaper` | `estimators.*` (same names) | fixed scaling, keyword API |
-| `dwelch.dwelch_b0/b1` | `dwelch.dwelch_b0/b1` | rebuilt on shared assembly |
+| `dwelch.dwelch_b0/b1` | `dwelch.dquad` | rebuilt on shared assembly; B0 kept and renamed, B1 dropped (sec. 5b) |
 | `util.get_exact_rfft_psd` | `util.psd_from_acf` | vectorized + batched |
 | `util.split` | `util.segment` | vectorized |
 | `util.get_nfreq` | `util.get_nfreq` | kept |
@@ -178,8 +175,8 @@ so the start must lie inside it. This matches the original's strategy
 (`solver.py:462-489`) but fixes its never-firing exhaustion guard
 (`elif attempt == max_attempts` inside `range(max_attempts)`) and removes the
 redundant first draw that was immediately overwritten (`solver.py:443-448`).
-On exhaustion the new code raises with a pointer to `regime_diagnostic` /
-`mode="smooth"`.
+On exhaustion the new code raises with a note that debiasing is likely not
+appropriate for the estimate.
 
 *History note:* the first cut of this rewrite instead started debias chains
 deterministically at the all-knots configuration. That was a regression,
@@ -201,34 +198,8 @@ fixed seed is now a test.
 
 ## 4. New features
 
-* **`regime_diagnostic` + `window_bandwidth`** (`diagnostic.py`): the
-  debias-or-smooth rule `fit_psd(mode="auto")` uses. It replaces the paper's
-  Sec. IV-C sign rule (all-knots WLS on the window-convolved bases; debias
-  only when every coefficient is positive), which false-negatives on small or
-  noisy data (noise-driven negative coefficients; collinearity of
-  window-convolved bases below the window bandwidth; approximation-error
-  negatives on sharp spectra). The new rule (a) computes the spectral
-  window's equivalent bandwidth from the kernel by Parseval and floors the
-  diagnostic mesh there — the finest spacing the blur makes identifiable —
-  and (b) decides by the non-negative-least-squares fit gap: debias iff a
-  *positive* blur-matched representation fits essentially as well as the
-  best unconstrained one (which is all the positivity-truncated sampler
-  needs). `RegimeDiagnostic` reports the decision plus `gap_per_constraint`,
-  `n_constrained`, `bandwidth_bins`, `knot_spacing`, and `condition_number`.
-  On the calibration probes it recovers the paper's intended verdict in
-  every bias-dominant case, including the sunspot series where the sign
-  rule refused to debias. **Note the semantics of `fit_psd(mode="auto")`**:
-  less conservative than the paper's sign rule; blur-consistent
-  variance-dominant scenarios (e.g. Matern under multitaper) dispatch to
-  debias, where the sampler's own model selection provides the smoothing.
-* **`fit_psd(estimate, freqs, kernel=..., n_time=..., mode="auto")`**: the
-  paper's full workflow in one call — diagnostic, regime dispatch, sampling,
-  posterior summary.
-* **Linear-scale results always** (`FitResult.mean/std/posterior_predictive`):
-  smooth-mode draws are exponentiated per draw inside the predictive pass.
-  The original returned log-scale posterior draws in log mode and left the
-  exponentiation (and the Jensen-inequality subtlety of exponentiating a mean)
-  to the caller.
+* **`fit_psd(estimate, n_time=...)`**: the full workflow in one call —
+  sampler construction, sampling, posterior summary.
 * **`sample_ar`** (`simulate.py`): AR(p) simulation via `scipy.signal.lfilter`
   with the same polynomial convention as `analytic.ar_spectrum`, replacing the
   `statsmodels` dependency used by the original's scripts.
@@ -254,6 +225,56 @@ fixed seed is now a test.
 * Unused `MH` attributes (`sigma2s`, `mean`, `mode`, `std`, `probs`), unused
   imports, the stale 3-vs-4-value return annotation on the kernel, and the
   `tqdm` progress dependency.
+
+## 5b. Removed after the initial rewrite
+
+* **Smooth mode (`mode="smooth"`) and the whole mode-dispatch machinery.**
+  The package now serves only the bias-dominant regime, so `PSDebias` takes
+  no `mode`; `kernel` and `n_time` are required. `FitResult.mode` is gone,
+  and `_predictive_pass` no longer carries the log-scale/`exp` branch or the
+  lognormal standard-deviation mapping. `_mh_kernel` lost its
+  `require_positive` flag — coefficient positivity is now always enforced.
+
+* **The `dof` field on `SpectralEstimate`, with `_welch_dof` and
+  `_lag_window_dof`.** These existed only to build the smooth-mode offset
+  `log(dof) - digamma(dof)`, which corrected the downward bias of
+  `E[log I(f)]`.
+
+  That offset was a **numerical no-op**, and its removal changes no output.
+  The B1 hats over the active knots are a partition of unity, so the constant
+  vector lies exactly in the design's column span (verified to 2.2e-16 over
+  random configurations; pinned by
+  `tests/test_splines.py::TestPartitionOfUnity`). Adding a constant to the
+  response therefore shifted the fitted values by exactly that constant and
+  left ESS, the posterior variance and the coefficient draws untouched — and
+  the code then subtracted the same constant back at output
+  (`exp(mu - offset)`). The correction cancelled itself.
+
+* **`corr` parameters and the correlation-matrix machinery** on `welch`,
+  `lag_window` and `multitaper` (`corr_mat`, `log_corr_mat`,
+  `_kibble_log_corr`, `_lag_window_corr_mats`): accepted and ignored.
+
+* **`mode="auto"` and the regime diagnostic** (`diagnostic.regime_diagnostic`,
+  the bandwidth-matched NNLS-gap rule). The module was already absent; the
+  stale `mode="auto"` end-to-end tests and the ~220-line HOW_IT_WORKS section
+  documenting it have now been removed too.
+
+* **`splines.knot_grid(ghost_knots=)`** — always `True` without smooth mode.
+  It now returns `(knots, halve_idx)` rather than the same interior-index
+  array under two names.
+
+* **`dwelch_b0` renamed to `dquad`, and `dwelch_b1` removed.** The B1
+  fixed-mesh variant had no caller in the library, the study scripts or the
+  notebooks. `dquad` returns the debiased spectrum alone, not `(freqs, psd)`
+  — `freqs` was the caller's own input echoed back. The auto-speccy
+  construction oracle that cross-checked the B1 assembly
+  (`tests/test_dwelch.py::original_dwelch_b1`) went with it; the equivalent
+  guarantee for the *sampler's* B1 path is still pinned by
+  `test_splines.py::test_unbiased_equals_direct_evaluation` and
+  `test_design.py`.
+
+* **`trace/` and the generated HTML copies of the docs** (`README.html`,
+  `docs/*.html`).
 
 ## 6. Behavioral notes (deliberate, visible differences)
 

@@ -35,7 +35,7 @@ class TestEndToEnd:
         # dense candidate mesh (~128 knots) as in the paper's studies; the
         # sampler prunes it to order-20 active bases
         fit = fit_psd(
-            est, n_time=l, mode="debias", knot_spacing=4,
+            est, n_time=l, knot_spacing=4,
             rng=np.random.default_rng(1),
             n_iterations=20_000, warmup=10_000, thin=10, n_beta_draws=20,
         )
@@ -47,20 +47,7 @@ class TestEndToEnd:
         peak_region = (freqs > 0.08) & (freqs < 0.16)
         assert fit.mean[peak_region].max() > 0.5 * truth[peak_region].max()
 
-    def test_ar4_mode_auto_dispatches_debias(self):
-        # On a coarser diagnostic mesh this scenario passes the sign check
-        rng = np.random.default_rng(2024)
-        l, m = 1024, 32
-        x = sample_ar(1, m * l, PAPER_AR_POLY, rng=rng)[0]
-        est = welch(x, segment_length=l, n_segments=m, step=l)
-        fit = fit_psd(
-            est, n_time=l, mode="auto", knot_spacing=16,
-            rng=rng, n_iterations=5_000, warmup=2_000, thin=10, n_beta_draws=10,
-        )
-        assert fit.mode == "debias"
-        assert np.all(fit.mean > 0)
-
-    def test_matern_smooth_beats_raw_multitaper(self):
+    def test_matern_debias_beats_raw_multitaper(self):
         rng = np.random.default_rng(2025)
         n = 2**13
         x = sample_matern(1, n, 1.0, 1.0, 0.1, rng=rng)[0]
@@ -69,12 +56,9 @@ class TestEndToEnd:
         truth = matern_spectrum(freqs, 1.0, 1.0, 0.1)
 
         fit = fit_psd(
-            est, n_time=n, mode="auto", knot_spacing=16,
+            est, n_time=n, knot_spacing=16,
             rng=rng, n_iterations=20_000, warmup=10_000, thin=10, n_beta_draws=20,
         )
-        # With the bandwidth-matched regime diagnostic this dispatches
-        # "debias" (the multitaper blur genuinely matches the bases); either
-        # regime must improve on the raw multitaper against analytic truth.
         assert np.all(fit.mean > 0)
         assert log_mse(fit.mean, truth) < log_mse(est.psd, truth)
 
@@ -87,12 +71,10 @@ class TestEndToEnd:
         x = np.genfromtxt(SUNSPOT_CSV, delimiter=";").T[1]
         est = multitaper(x, nw=3.5)
         fit = fit_psd(
-            est, n_time=len(x), mode="auto",
+            est, n_time=len(x),
             knot_spacing=2, rng=np.random.default_rng(1),
             n_iterations=20_000, warmup=10_000, thin=10, n_beta_draws=20,
         )
-        # the regime diagnostic must dispatch the paper's choice here
-        assert fit.mode == "debias"
         assert fit.acceptance_rate > 0.05
         assert len(np.unique(fit.gammas, axis=0)) > 10
         assert np.all(np.isfinite(fit.mean))
@@ -105,7 +87,7 @@ class TestEndToEnd:
         x = sample_ar(1, m * l, PAPER_AR_POLY, rng=rng)[0]
         est = welch(x, segment_length=l, n_segments=m, step=l)
         fit = fit_psd(
-            est, n_time=l, mode="smooth", knot_spacing=8,
+            est, n_time=l, knot_spacing=8,
             rng=rng, n_iterations=10_000, warmup=5_000, thin=10, n_beta_draws=20,
         )
         assert np.all(fit.std > 0)

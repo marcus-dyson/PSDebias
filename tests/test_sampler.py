@@ -84,12 +84,18 @@ class TestConditionalDraws:
     def test_moments_for_fixed_configuration(self, welch_ar4):
         # Freeze gamma by proposing no-op flips; the kernel then draws
         # (sigma^2, beta) from the conditional posterior of one configuration.
-        freqs, psd, _, _, *_ = welch_ar4
-        y = np.log(psd)
-        knots, _, halve = knot_grid(freqs, 16)
-        falling, rising = half_bases(freqs, knots)
-        n_interior = len(knots) - 2
-        gamma0 = np.ones(n_interior, dtype=np.int8)
+        # Uses the sampler's own window-convolved fitting primitives, so the
+        # regression here is exactly the one the chain runs.
+        freqs, psd, kernel, *_ = welch_ar4
+        sampler = PSDebias(
+            psd, freqs, kernel=kernel, n_time=512, knot_spacing=16,
+            rng=np.random.default_rng(3),
+        )
+        y = sampler.response
+        falling, rising = sampler._falling_fit, sampler._rising_fit
+        knots, halve = sampler.knots, EMPTY_IDX
+        n_interior = sampler.n_interior
+        gamma0 = sampler._prior_initial_gamma(1.0, 1.0)
 
         rng = np.random.default_rng(3)
         n_iter, n_draws = 400, 100
@@ -105,9 +111,9 @@ class TestConditionalDraws:
             rng.chisquare(nu, size=(n_iter, n_draws)),
             rng.standard_normal((n_iter, n_draws, n_interior + 2)),
             c, a_sigma, b_sigma, 1.0, 1.0,
-            0, n_iter, 1, False,
+            0, n_iter, 1,
         )
-        assert np.all(gammas == 1)
+        assert np.all(gammas == gamma0)  # every proposal was a no-op flip
 
         design = assemble_design(falling, rising, gamma0, knots, halve)
         p = design.shape[1]
@@ -131,12 +137,12 @@ class TestConditionalDraws:
 
 class TestPSDebias:
     def test_determinism(self, welch_ar4):
-        freqs, psd, kernel, dof, *_ = welch_ar4
+        freqs, psd, kernel, *_ = welch_ar4
         kwargs = dict(n_iterations=2000, warmup=500, thin=5, n_beta_draws=5)
         results = []
         for _ in range(2):
             sampler = PSDebias(
-                psd, freqs, mode="smooth", dof=dof, knot_spacing=16,
+                psd, freqs, kernel=kernel, n_time=512, knot_spacing=16,
                 rng=np.random.default_rng(42),
             )
             results.append(sampler.sample(**kwargs))
@@ -145,9 +151,10 @@ class TestPSDebias:
         np.testing.assert_array_equal(results[0].mean, results[1].mean)
 
     def test_map_estimate_uses_kernel_posterior(self, welch_ar4):
-        freqs, psd, kernel, dof, *_ = welch_ar4
+        freqs, psd, kernel, *_ = welch_ar4
         sampler = PSDebias(
-            psd, freqs, mode="smooth", dof=dof, knot_spacing=16, rng=np.random.default_rng(2)
+            psd, freqs, kernel=kernel, n_time=512, knot_spacing=16,
+            rng=np.random.default_rng(2),
         )
         res = sampler.sample(n_iterations=2000, warmup=500, thin=5, n_beta_draws=5)
         gamma_map, curve = sampler.map_estimate()
@@ -156,7 +163,9 @@ class TestPSDebias:
         # check the argmax matches (guards sampler/selector formula drift)
         scores = []
         for i in range(len(res.gammas)):
-            design = sampler.design_matrix(res.gammas[i], biased=False)
+            # the chain's ESS comes from the window-convolved FITTING design,
+            # so the reference must re-score on that one, not the output bases
+            design = sampler.design_matrix(res.gammas[i], biased=True)
             scores.append(
                 reference_log_posterior(
                     sampler.response, design, int(res.gammas[i].sum()),
@@ -168,9 +177,9 @@ class TestPSDebias:
         assert curve.shape == freqs.shape
 
     def test_debias_mode_positive_coefficients(self, welch_ar4):
-        freqs, psd, kernel, _, *_ = welch_ar4
+        freqs, psd, kernel, *_ = welch_ar4
         sampler = PSDebias(
-            psd, freqs, mode="debias", kernel=kernel, n_time=512,
+            psd, freqs, kernel=kernel, n_time=512,
             knot_spacing=16, rng=np.random.default_rng(11),
         )
         res = sampler.sample(n_iterations=3000, warmup=1000, thin=5, n_beta_draws=5)
@@ -183,9 +192,10 @@ class TestPSDebias:
             assert np.all(np.isnan(res.betas[i, :, p:]))
 
     def test_store_predictive(self, welch_ar4):
-        freqs, psd, _, dof, *_ = welch_ar4
+        freqs, psd, kernel, *_ = welch_ar4
         sampler = PSDebias(
-            psd, freqs, mode="smooth", dof=dof, knot_spacing=16, rng=np.random.default_rng(5)
+            psd, freqs, kernel=kernel, n_time=512, knot_spacing=16,
+            rng=np.random.default_rng(5),
         )
         res = sampler.sample(
             n_iterations=500, warmup=100, thin=5, n_beta_draws=4, store_predictive=True
@@ -193,15 +203,16 @@ class TestPSDebias:
         assert res.posterior_predictive is not None
         n_kept = (500 + 4) // 5
         assert res.posterior_predictive.shape == (n_kept * 4, len(freqs))
-        # smooth `mean` is the plug-in exp(E[log S]) = the geometric mean of the
-        # (offset-stripped) predictive draws, not their arithmetic mean.
-        geo_mean = np.exp(np.log(res.posterior_predictive).mean(axis=0))
-        np.testing.assert_allclose(geo_mean, res.mean, rtol=1e-10)
+        # draws are linear-scale spectra, so `mean` is their arithmetic mean
+        np.testing.assert_allclose(
+            res.posterior_predictive.mean(axis=0), res.mean, rtol=1e-10
+        )
 
     def test_initial_gamma_override(self, welch_ar4):
-        freqs, psd, _, dof, *_ = welch_ar4
+        freqs, psd, kernel, *_ = welch_ar4
         sampler = PSDebias(
-            psd, freqs, mode="smooth", dof=dof, knot_spacing=16, rng=np.random.default_rng(9)
+            psd, freqs, kernel=kernel, n_time=512, knot_spacing=16,
+            rng=np.random.default_rng(9),
         )
         gamma0 = np.zeros(sampler.n_interior, dtype=np.int8)
         res = sampler.sample(
@@ -215,15 +226,16 @@ class TestPSDebias:
             )
 
     def test_input_validation(self, welch_ar4):
-        freqs, psd, kernel, _, *_ = welch_ar4
-        with pytest.raises(ValueError, match="mode"):
-            PSDebias(psd, freqs, mode="banana")
-        with pytest.raises(ValueError, match="requires kernel"):
-            PSDebias(psd, freqs, mode="debias")
+        freqs, psd, kernel, *_ = welch_ar4
+        kw = dict(kernel=kernel, n_time=512)
+        with pytest.raises(TypeError):
+            PSDebias(psd, freqs)  # kernel and n_time are required
         with pytest.raises(ValueError, match="strictly positive"):
-            PSDebias(psd - psd.max(), freqs, mode="smooth")
+            PSDebias(psd - psd.max(), freqs, **kw)
         with pytest.raises(ValueError, match="inside"):
-            PSDebias(psd, freqs + 0.5, mode="smooth")
+            PSDebias(psd, freqs + 0.5, **kw)
+        with pytest.raises(ValueError, match="length"):
+            PSDebias(psd[:-1], freqs, **kw)
 
 
 SUNSPOT_CSV = Path(__file__).parent.parent / "data" / "SN_y_tot_V2.0.csv"
@@ -234,7 +246,7 @@ def sunspot_sampler():
     x = np.genfromtxt(SUNSPOT_CSV, delimiter=";").T[1]
     freqs, psd, kernel, *_ = multitaper(x, nw=3.5)
     return PSDebias(
-        psd, freqs, mode="debias", kernel=kernel, n_time=len(x),
+        psd, freqs, kernel=kernel, n_time=len(x),
         knot_spacing=2, rng=np.random.default_rng(1),
     )
 
@@ -267,7 +279,7 @@ class TestDebiasInitialization:
         draws = []
         for _ in range(2):
             s = PSDebias(
-                psd, freqs, mode="debias", kernel=kernel, n_time=len(x),
+                psd, freqs, kernel=kernel, n_time=len(x),
                 knot_spacing=2, rng=np.random.default_rng(123),
             )
             draws.append(s._prior_initial_gamma(1.0, 1.0))

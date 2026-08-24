@@ -13,6 +13,7 @@ from psdebias.splines import (
     b1_rising,
     half_bases,
     half_bases_biased,
+    knot_grid,
 )
 
 
@@ -158,3 +159,24 @@ class TestAssembleDesign:
                 np.testing.assert_allclose(
                     design_b[j_freq, col], expected, rtol=5e-3, atol=1e-6
                 )
+
+
+class TestPartitionOfUnity:
+    """B1 hats over the active knots sum to 1 at every grid point.
+
+    This is what makes the constant vector lie exactly in the design's column
+    span, so adding a constant to the response shifts the fit by exactly that
+    constant and changes nothing else. A former log-scale offset correction
+    relied on this and consequently cancelled itself out; pin the property so
+    any future basis change surfaces loudly rather than silently.
+    """
+
+    def test_columns_sum_to_one(self, rng):
+        n = 256
+        freqs = np.arange(1, n // 2) / n
+        knots, halve = knot_grid(freqs, 8)
+        falling, rising = half_bases(freqs, knots)
+        for _ in range(50):
+            gamma = (rng.uniform(size=len(knots) - 2) < rng.uniform(0.05, 0.95)).astype(np.int8)
+            design = assemble_design(falling, rising, gamma, knots, halve)
+            np.testing.assert_allclose(design.sum(axis=1), 1.0, atol=1e-12)

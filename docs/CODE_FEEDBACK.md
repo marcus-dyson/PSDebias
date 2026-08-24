@@ -4,6 +4,9 @@ A review of the `psdebias` source (`src/psdebias/`) and the study scripts
 (`scripts/`), covering what the code does well and a short list of issues worth
 attention. Nothing here has been applied to the source — it is observation only.
 
+This is a point-in-time review; items covering the since-removed smooth-mode
+and regime-diagnostic code have been dropped.
+
 ## Summary
 
 This is a strong, carefully engineered codebase. The numerical core is
@@ -47,7 +50,7 @@ below are refinements, not blockers.
   estimators.
 
 - **Clear structure.** Sensible module separation (analytic / simulate /
-  estimators / splines / sampler / diagnostic / dwelch / util), typed
+  estimators / splines / sampler / dwelch / util), typed
   signatures throughout, and `NamedTuple` / `dataclass` result types.
 
 ## Issues and suggestions
@@ -60,37 +63,26 @@ below are refinements, not blockers.
    Latent in practice (`lag` defaults to `n // 10`), but the guard now rejects
    the corrupting band instead of silently producing garbage.
 
-2. **`sampler.fit_psd(mode="auto")` recomputes the biased basis FFT.**
-   `regime_diagnostic` builds the window-convolved bases (`half_bases_biased`)
-   to score its bandwidth-matched mesh, then `PSDebias.__init__` builds them
-   again for the sampler's mesh. The two meshes differ, so the work is not
-   literally reusable, but the batched-FFT cost is paid twice per auto-fit.
-   Worth noting if auto-mode fitting ever becomes a bottleneck.
-
-3. **`c` (g-prior scale) convention diverges from the paper.** The sampler
+2. **`c` (g-prior scale) convention diverges from the paper.** The sampler
    default is `c = len(response)` = number of bins `g` (the paper's choice), but
    the study scripts pass `c = n_series` (`run_adaptive`, documented in
    `CHANGES.md` §6). Both are defensible; the risk is that someone reproducing
    paper figures from the scripts gets different shrinkage without noticing. A
    one-line reminder at the call site (or a named constant) would help.
 
-4. **Memory scaling of stored draws.** `sampler` stores `betas` as a
+3. **Memory scaling of stored draws.** `sampler` stores `betas` as a
    `n_kept x n_beta_draws x (L+2)` NaN-padded array of doubles. This is
    documented in `_mh_kernel`, but it is worth stating as a concrete limit:
    with a fine candidate mesh (large `L`) and many `n_beta_draws`, this array
    dominates the memory bill. A downstream user tightening `knot_spacing`
    should expect quadratic-ish growth here.
 
-5. **`sampler._mh_kernel` size and testability.** It is a ~150-line numba
+4. **`sampler._mh_kernel` size and testability.** It is a ~150-line numba
    kernel threading many mutable buffers (`beta`, `chol`, `design`, `work`, …)
    through the chain state. The invariants are well documented, but the accept
    step and the conditional `(sigma^2, beta)` draw are hard to exercise in
    isolation. If this file grows, consider factoring the conditional-draw block
    into a separately testable `@njit` helper.
-
-6. **Minor wording.** The comment at `estimators.py:22`
-   ("This gets enumerated when output") reads awkwardly and does not add much
-   over the `NamedTuple` declaration it annotates.
 
 ## Closing
 

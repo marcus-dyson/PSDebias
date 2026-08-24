@@ -4,43 +4,35 @@
 Draws AR(4) and Matern realisations, estimates their spectra with Welch /
 lag-window / multitaper, and runs the adaptive :class:`psdebias.PSDebias`
 sampler on each, caching everything under ``realisations/`` so
-``notebooks/bias-variance.ipynb`` can measure empirical bias and variance.
-One script, two arms::
+``notebooks/bias-variance.ipynb`` can measure empirical bias and variance::
 
-    python generate_realisations.py debias    # bias-dominant arm  -> *_debiasing/
-    python generate_realisations.py smooth    # variance-dominant  -> *_unbiased/
+    python generate_realisations.py
 
-The debias arm runs the sampler in ``mode="debias"`` and also computes the
-fixed-mesh ``dwelch_b0`` baselines; the smooth arm runs ``mode="smooth"``
-with no closed-form debiasing. ``--n-samples/--n-iterations/--warmup`` exist
-for smoke runs.
+Alongside the adaptive fits it computes the fixed-mesh ``dquad`` baselines.
+``--n-samples/--n-iterations/--warmup`` exist for smoke runs.
 
-Output tree (``<suffix>`` is ``_debiasing`` or ``_unbiased``)::
+Output tree::
 
     realisations/
-    |-- ar4<suffix>/
-    |   |-- welch_sim/  (samples, welch, [dwelch,] adapt_welch)
-    |   `-- quad_sim/   (samples, lag-window, multitaper, [dlag, dmulti,]
+    |-- ar4_debiasing/
+    |   |-- welch_sim/  (samples, welch, dwelch, adapt_welch)
+    |   `-- quad_sim/   (samples, lag-window, multitaper, dlag, dmulti,
     |                    adapt_lag, adapt_multi)
-    `-- matern<suffix>/ (same structure)
+    `-- matern_debiasing/ (same structure)
 
-In the debias arm the quad samples are per-setting (``samples/lag_NW{n}.npy``,
-``samples/multi_NW{n}.npy``), one file per estimator; the smooth arm keeps
-one shared ``samples/samples.npy`` (which
-``wavelet_thresholding.py`` also reads). Adaptive CSVs hold one row per
-realisation, ``[E[#knots]] + mean_S(f) + std_S(f)``, appended and flushed as
-they finish so interrupted runs resume from the last complete row.
+Quad samples are per-setting (``samples/lag_NW{n}.npy``, ``samples/multi_NW{n}.npy``),
+one file per estimator. Adaptive CSVs hold one row per realisation,
+``[E[#knots]] + mean_S(f) + std_S(f)``, appended and flushed as they finish so
+interrupted runs resume from the last complete row.
 
 Differences from the retired ``auto_speccy`` scripts this file replaces:
 
 * the corrected psdebias posterior (docs/CHANGES.md sec. 2) -- regenerated
   results intentionally differ from historical runs;
-* CSVs are linear-scale ``S(f)`` in both arms (smooth-mode draws are
-  exponentiated inside the sampler);
 * per-realisation seeded generators instead of one global ``np.random.seed``,
   so a resumed CSV re-derives the same stream for every row;
 * Welch segments step by exactly ``L`` (v1 stepped ``L - 1``);
-* the dwelch/dquad mesh step equals the arm's sampler ``knot_spacing``
+* the dwelch/dquad mesh step equals the sampler ``knot_spacing``
   (the old independent res0/res1 grids are gone).
 """
 
@@ -68,7 +60,7 @@ from numpy import typing as npt
 from psdebias import (
     PSDebias,
     SpectralEstimate,
-    dwelch_b0,
+    dquad,
     lag_window,
     multitaper,
     sample_ar,
@@ -92,14 +84,11 @@ except ImportError:  # tqdm is a script-only nicety, not a psdebias dependency
 
 @dataclass(eq=False)
 class Config:
-    """All knobs for one arm of the study."""
+    """All knobs for the study."""
 
-    arm: str                    # "debias" | "smooth"
-    process_suffix: str         # "_debiasing" | "_unbiased"
-    compute_debiasing: bool
-    n_samples: int = 200 #
+    n_samples: int = 200
 
-    # Welch arm of the study
+    # Welch half of the study
     segment_length: int = 1024
     n_segments: npt.NDArray[np.int64] = field(
         default_factory=lambda: 2 ** np.arange(3, 7)  # 8, 16, 32, 64
@@ -107,7 +96,7 @@ class Config:
     taper: npt.NDArray[np.float64] | None = None  # None -> rectangular
     knot_spacing_welch: int = 4
 
-    # Quadratic (lag-window / multitaper) arm of the study
+    # Quadratic (lag-window / multitaper) half of the study
     n_time_quad: int = 2 ** 11
     nws_quad: npt.NDArray[np.int64] = field(default_factory=lambda: np.array([3, 4, 6, 8]))
     lags_quad: npt.NDArray[np.int64] = field(
@@ -141,35 +130,6 @@ class Config:
     base_path: str = "./realisations"
 
 
-DEBIAS_CONFIG = dict(
-    arm="debias",
-    process_suffix="_debiasing",
-    compute_debiasing=True,
-    segment_length=1024,
-    taper=None,  # rectangular
-    knot_spacing_welch=4,
-    n_time_quad=2 ** 11,
-    nws_quad=np.array([3, 4, 6, 8]),
-    lags_quad=2 ** 11 // np.array([3, 4, 8, 16]),
-    window="bartlett",
-    knot_spacing_quad=8,
-)
-
-SMOOTH_CONFIG = dict(
-    arm="smooth",
-    process_suffix="_unbiased",
-    compute_debiasing=False,
-    segment_length=2 ** 12,
-    taper=np.hanning(2 ** 12),  # estimators normalize to unit energy
-    knot_spacing_welch=16,
-    n_time_quad=2 ** 13,
-    nws_quad=np.array([3, 4, 5, 6]),
-    lags_quad=2 ** 13 // np.array([3, 4, 5, 6]),
-    window="blackman",
-    knot_spacing_quad=32,
-)
-
-
 # =============================================================================
 # RNG: one deterministic stream per (purpose, setting, realisation)
 # =============================================================================
@@ -195,7 +155,7 @@ def draw_process(cfg: Config, process: str, length: int, rng: np.random.Generato
 
     Draws from the same stream are prefix-nested: a shorter request consumes a
     prefix of the same underlying noise, so callers that reuse one stream tag
-    across sample lengths (the Welch arm's segment counts) get truncations of
+    across sample lengths (the Welch segment counts) get truncations of
     a common realisation rather than independent redraws.
     """
     if process == "ar4":
@@ -263,12 +223,12 @@ def dwelch_gamma(n_freqs: int, step: int) -> npt.NDArray[np.int8]:
 
 
 def debias_fixed_mesh(psds, freqs, kernel, n_time: int, step: int):
-    """``dwelch_b0`` each row; keep only converged, strictly-positive results."""
+    """``dquad`` each row; keep only converged, strictly-positive results."""
     gamma = dwelch_gamma(len(freqs), step)
     results = []
     for psd in psds:
         try:
-            results.append(dwelch_b0(psd, freqs, gamma=gamma, kernel=kernel, n_time=n_time)[1])
+            results.append(dquad(psd, freqs, gamma=gamma, kernel=kernel, n_time=n_time))
         except RuntimeError:  # nnls failed to converge
             continue
     debiased = np.array(results)
@@ -291,21 +251,16 @@ def run_adaptive(
     knot_spacing: int,
     rng: np.random.Generator,
 ):
-    """Fit one estimate with the arm's sampler mode; return (mean, std, E[#knots]).
+    """Fit one estimate; return (mean, std, E[#knots]).
 
     ``c`` is the g-prior scale: the study follows the original scripts in
     using the time-series length rather than the paper's default ``c = g``
     (docs/CHANGES.md sec. 6).
     """
-    if cfg.arm == "debias":
-        sampler = PSDebias(
-            est.psd, est.freqs, mode="debias", kernel=est.kernel, n_time=n_time,
-            dof=est.dof, knot_spacing=knot_spacing, rng=rng,
-        )
-    else:
-        sampler = PSDebias(
-            est.psd, est.freqs, mode="smooth", dof=est.dof, knot_spacing=knot_spacing, rng=rng,
-        )
+    sampler = PSDebias(
+        est.psd, est.freqs, kernel=est.kernel, n_time=n_time,
+        knot_spacing=knot_spacing, rng=rng,
+    )
     fit = sampler.sample(
         n_iterations=cfg.n_iterations, warmup=cfg.warmup, thin=cfg.thin,
         n_beta_draws=cfg.n_beta_draws, a_pi=cfg.a_pi, b_pi=cfg.b_pi,
@@ -416,17 +371,13 @@ def _run_adaptive_csv(
 
 
 def _sim_dir(cfg: Config, process: str, sim: str) -> str:
-    return os.path.join(cfg.base_path, f"{process}{cfg.process_suffix}", sim)
+    return os.path.join(cfg.base_path, f"{process}_debiasing", sim)
 
 
 def create_directory_structure(cfg: Config) -> None:
-    debias = cfg.compute_debiasing
-    welch_subdirs = ["samples", "welch"] + (["dwelch"] if debias else []) + ["adapt_welch"]
-    quad_subdirs = (
-        ["samples", "lag-window", "multitaper"]
-        + (["dlag", "dmulti"] if debias else [])
-        + ["adapt_lag", "adapt_multi"]
-    )
+    welch_subdirs = ["samples", "welch", "dwelch", "adapt_welch"]
+    quad_subdirs = ["samples", "lag-window", "multitaper",
+                    "dlag", "dmulti", "adapt_lag", "adapt_multi"]
     for process in ("ar4", "matern"):
         for sim, subdirs in (("welch_sim", welch_subdirs), ("quad_sim", quad_subdirs)):
             for subdir in subdirs:
@@ -451,13 +402,12 @@ def run_welch_simulations(cfg: Config, workers: int) -> None:
                 lambda x, m=m: welch_estimate(cfg, x, m), samples,
             )
 
-            if cfg.compute_debiasing:
-                load_or_compute(
-                    os.path.join(base, "dwelch", f"{m}.npy"),
-                    debias_fixed_mesh,
-                    psds, first.freqs, first.kernel, cfg.segment_length,
-                    cfg.knot_spacing_welch,
-                )
+            load_or_compute(
+                os.path.join(base, "dwelch", f"{m}.npy"),
+                debias_fixed_mesh,
+                psds, first.freqs, first.kernel, cfg.segment_length,
+                cfg.knot_spacing_welch,
+            )
 
     for m in tqdm(cfg.n_segments, desc="Welch: adaptive fits"):
         m = int(m)
@@ -474,24 +424,27 @@ def run_welch_simulations(cfg: Config, workers: int) -> None:
             )
             _run_adaptive_csv(
                 os.path.join(base, "adapt_welch", f"{m}.csv"),
-                cfg.n_samples, job, f"{process} adapt_welch({cfg.arm}) m={m}", workers,
+                cfg.n_samples, job, f"{process} adapt_welch m={m}", workers,
             )
 
 
-def _quad_variants(cfg: Config):
-    """The two quad estimators: (name, sample basename, estimator factory)."""
-    return (
-        ("lag", lambda lag: (lambda x: lag_estimate(cfg, x, lag)), "lag-window", "dlag"),
-        ("multi", lambda nw: (lambda x: multi_estimate(cfg, x, nw)), "multitaper", "dmulti"),
-    )
+# The two quad estimators: (name, output dir, fixed-mesh debias dir).
+QUAD_VARIANTS = (
+    ("lag", "lag-window", "dlag"),
+    ("multi", "multitaper", "dmulti"),
+)
 
 
-def quad_samples_path(cfg: Config, base: str, name: str, nw: int) -> str:
-    """Debias arm: per-setting samples, one file per estimator. Smooth arm:
-    one shared file for both estimators."""
-    if cfg.arm == "debias":
-        return os.path.join(base, "samples", f"{name}_NW{nw}.npy")
-    return os.path.join(base, "samples", "samples.npy")
+def quad_estimator(cfg: Config, name: str, lag: int, nw: int) -> Callable:
+    """The ``x -> SpectralEstimate`` closure for one quad variant/setting."""
+    if name == "lag":
+        return lambda x: lag_estimate(cfg, x, lag)
+    return lambda x: multi_estimate(cfg, x, nw)
+
+
+def quad_samples_path(base: str, name: str, nw: int) -> str:
+    """Per-setting samples, one file per estimator."""
+    return os.path.join(base, "samples", f"{name}_NW{nw}.npy")
 
 
 def run_quad_simulations(cfg: Config, workers: int) -> None:
@@ -501,36 +454,32 @@ def run_quad_simulations(cfg: Config, workers: int) -> None:
         nw, lag = int(nw), int(lag)
         for process in ("ar4", "matern"):
             base = _sim_dir(cfg, process, "quad_sim")
-            for name, make_estimator, est_dir, debias_dir in _quad_variants(cfg):
-                setting = lag if name == "lag" else nw
-                estimator = make_estimator(setting)
+            for name, est_dir, debias_dir in QUAD_VARIANTS:
+                estimator = quad_estimator(cfg, name, lag, nw)
                 samples = load_or_compute(
-                    quad_samples_path(cfg, base, name, nw),
+                    quad_samples_path(base, name, nw),
                     build_samples, cfg, process, cfg.n_time_quad,
-                    f"quad/{process}/{name}_NW{nw}" if cfg.arm == "debias"
-                    else f"quad/{process}/shared",
+                    f"quad/{process}/{name}_NW{nw}",
                 )
 
                 first, psds = load_or_stack(
                     os.path.join(base, est_dir, f"NW{nw}.npy"), estimator, samples
                 )
 
-                if cfg.compute_debiasing:
-                    load_or_compute(
-                        os.path.join(base, debias_dir, f"NW{nw}.npy"),
-                        debias_fixed_mesh,
-                        psds, first.freqs, first.kernel, cfg.n_time_quad,
-                        cfg.knot_spacing_quad,
-                    )
+                load_or_compute(
+                    os.path.join(base, debias_dir, f"NW{nw}.npy"),
+                    debias_fixed_mesh,
+                    psds, first.freqs, first.kernel, cfg.n_time_quad,
+                    cfg.knot_spacing_quad,
+                )
 
     for nw, lag in tqdm(settings, desc="Quad: adaptive fits"):
         nw, lag = int(nw), int(lag)
         for process in ("ar4", "matern"):
             base = _sim_dir(cfg, process, "quad_sim")
-            for name, make_estimator, _, _ in _quad_variants(cfg):
-                setting = lag if name == "lag" else nw
-                estimator = make_estimator(setting)
-                samples = np.load(quad_samples_path(cfg, base, name, nw))
+            for name, _, _ in QUAD_VARIANTS:
+                estimator = quad_estimator(cfg, name, lag, nw)
+                samples = np.load(quad_samples_path(base, name, nw))
 
                 job = RowJob(
                     cfg=cfg, samples=samples, estimator=estimator,
@@ -540,7 +489,7 @@ def run_quad_simulations(cfg: Config, workers: int) -> None:
                 )
                 _run_adaptive_csv(
                     os.path.join(base, f"adapt_{name}", f"NW{nw}.csv"),
-                    cfg.n_samples, job, f"{process} adapt_{name}({cfg.arm}) NW={nw}", workers,
+                    cfg.n_samples, job, f"{process} adapt_{name} NW={nw}", workers,
                 )
 
 
@@ -552,9 +501,11 @@ def _warmup_numba() -> None:
     try:
         n = 128
         freqs = np.arange(1, n // 2) / n
-        tmp = Config(**SMOOTH_CONFIG)
+        tmp = Config()
         tmp.n_iterations, tmp.warmup, tmp.thin, tmp.n_beta_draws = 2, 1, 1, 2
-        est = SpectralEstimate(freqs, np.ones(len(freqs)) + 0.1, np.zeros(n), np.float64(8.0))
+        taper = np.ones(n) / np.sqrt(n)
+        kernel = np.correlate(taper, taper, mode="full")[n - 1:]
+        est = SpectralEstimate(freqs, np.ones(len(freqs)) + 0.1, kernel)
         run_adaptive(tmp, est, n_time=n, n_series=n, knot_spacing=4,
                      rng=np.random.default_rng(0))
     except Exception:  # warmup is an optimization, never fatal
@@ -563,8 +514,6 @@ def _warmup_numba() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("arm", choices=("debias", "smooth"),
-                        help="which arm of the study to generate")
     parser.add_argument("--n-samples", type=int, default=None)
     parser.add_argument("--n-iterations", type=int, default=None)
     parser.add_argument("--warmup", type=int, default=None)
@@ -575,7 +524,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
 
-    cfg = Config(**(DEBIAS_CONFIG if args.arm == "debias" else SMOOTH_CONFIG))
+    cfg = Config()
     for name in ("n_samples", "n_iterations", "warmup", "base_path", "seed"):
         value = getattr(args, name)
         if value is not None:

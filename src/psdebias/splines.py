@@ -46,50 +46,37 @@ def knot_grid(
     knot_spacing: int,
     *,
     log_knots: bool = False,
-    ghost_knots: bool = False,
-) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.int64], npt.NDArray[np.int64]]:
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.int64]]:
     """Candidate knot set for the adaptive sampler.
 
     Selects ``len(freqs) // knot_spacing`` grid positions (uniformly, or
-    geometrically when ``log_knots`` to resolve low-frequency structure).
-    With ``ghost_knots`` (debias mode) the candidate set is
-    ``[0.0, freqs[pos], 0.5]`` — every selected frequency is an interior
-    candidate and the off-grid ghosts let the spectral-window convolution wrap
-    the full domain. Without (smooth mode) the first and last selected
-    frequencies are the fixed end knots.
+    geometrically when ``log_knots`` to resolve low-frequency structure). The
+    candidate set is ``[0.0, freqs[pos], 0.5]``: every selected frequency is an
+    interior candidate, and the two off-grid ghost knots let the spectral-window
+    convolution wrap the full domain.
 
-    Returns ``(knots, interior_idx, halve_idx)`` where ``interior_idx`` are the
-    grid indices of the interior candidates (kept as integers so no float
-    matching is ever needed downstream) and ``halve_idx`` is the same array,
-    ready to pass to :func:`assemble_design` for direct-evaluation bases.
+    The spectral window redistributes power across the whole of [0, 1/2] (its
+    tails wrap around DC and Nyquist), so the basis must span the full interval
+    even though the data grid excludes the endpoints. The ghost knots sit OFF
+    the data grid at exactly 0 and 1/2 and are never selectable — they are the
+    fixed ends.
+
+    Returns ``(knots, halve_idx)`` where ``halve_idx`` holds the grid indices of
+    the interior candidates, ready to pass to :func:`assemble_design` for
+    direct-evaluation bases. They are carried around as *integer positions into
+    freqs* rather than knot values so that downstream code never has to
+    rediscover "which grid point is a knot" by comparing floats — the original
+    package did that with searchsorted on float equality, which only worked by
+    luck of shared construction.
     """
     n = len(freqs)
-    n_target = max(int(n // knot_spacing), 2 if not ghost_knots else 1)
+    n_target = max(n // knot_spacing, 1)
     if log_knots:
         pos = np.unique(np.geomspace(1, n - 1, n_target).astype(np.int64))
     else:
         pos = np.unique(np.linspace(0, n - 1, n_target, dtype=np.int64))
-    if ghost_knots:
-        # Debias mode. The spectral window redistributes power across the whole
-        # of [0, 1/2] (its tails wrap around DC and Nyquist), so the basis must
-        # span the full interval even though the data grid excludes the
-        # endpoints. The two ghost knots sit OFF the data grid at exactly 0 and
-        # 1/2; every selected frequency then becomes a selectable interior
-        # candidate. The ghosts are never selectable — they are the fixed ends.
-        knots = np.concatenate(([0.0], freqs[pos], [0.5]))
-        interior_idx = pos
-    else:
-        # Smooth mode. No convolution, so nothing leaks outside the data grid:
-        # the first/last selected frequencies themselves act as the fixed end
-        # knots and only the strictly interior selections are up for selection.
-        knots = freqs[pos]
-        interior_idx = pos[1:-1]
-    # interior_idx are *integer positions into freqs*. They are carried around
-    # instead of the knot values so that downstream code (the halve_idx
-    # correction, tests) never has to rediscover "which grid point is a knot"
-    # by comparing floats — the original package did that with searchsorted on
-    # float equality, which only worked by luck of shared construction.
-    return knots, interior_idx, interior_idx
+    knots = np.concatenate(([0.0], freqs[pos], [0.5]))
+    return knots, pos
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +212,7 @@ def half_bases_biased(
 
 
 # ---------------------------------------------------------------------------
-# B0 bases (used by dwelch_b0)
+# B0 bases (used by dquad)
 # ---------------------------------------------------------------------------
 
 def basis_b0(

@@ -3,14 +3,11 @@
 Implements the paper's Algorithm 1: Metropolis-Hastings over the latent binary
 knot vector gamma, with the regression coefficients and noise variance
 integrated out in closed form (Zellner g-prior + inverse-gamma, Appendix B).
-One class serves both regimes:
 
-* ``mode="smooth"`` (variance-dominant): fit ``log(estimate)`` on unconvolved
-  B1 bases with unit weights.
-* ``mode="debias"`` (bias-dominant): fit the constant response ``1`` on
-  spectral-window-convolved bases scaled by ``1/estimate`` (paper Sec. IV-B),
-  with coefficients constrained positive; the debiased spectrum is read off
-  the *unconvolved* bases.
+The regression is the paper's Eq. 5 debiasing (Sec. IV-B): the constant
+response ``1`` is fitted on spectral-window-convolved bases scaled by
+``1/estimate``, with coefficients constrained positive, and the debiased
+spectrum is read off the *unconvolved* bases at the fitted coefficients.
 
 The log posterior over configurations is (paper Appendix B, with ``g`` the
 number of frequency bins, ``q`` active interior knots, ``p = q + 2`` design
@@ -34,9 +31,9 @@ from dataclasses import dataclass
 import numpy as np
 from numba import njit
 from numpy import typing as npt
-from scipy.special import digamma
 
 from psdebias import splines
+from psdebias.estimators import SpectralEstimate
 
 
 # ---------------------------------------------------------------------------
@@ -197,7 +194,6 @@ def _mh_kernel(
     warmup: int,
     n_iterations: int,
     thin: int,
-    require_positive: bool,
 ):
     """Algorithm 1. Returns ``(gammas, betas, ess_kept, n_accept)``.
 
@@ -269,19 +265,18 @@ def _mh_kernel(
         ok, ess_new = _least_squares(design_new, y, yty, beta_new[:p_new], chol_new[:p_new, :p_new])
 
         # Accept rule: reject outright if the Gram matrix was singular (ok is
-        # False) or, in debias mode, if any least-squares coefficient is
-        # non-positive — that truncation keeps the chain inside configurations
-        # whose debiased spectrum is positive (paper Algorithm 1, line 5).
-        # Otherwise standard Metropolis on the log scale:
-        # accept iff min(0, delta) > log U, folded into two comparisons here.
+        # False) or if any least-squares coefficient is non-positive — that
+        # truncation keeps the chain inside configurations whose debiased
+        # spectrum is positive (paper Algorithm 1, line 5). Otherwise standard
+        # Metropolis on the log scale: accept iff min(0, delta) > log U, folded
+        # into two comparisons here.
         accept = False
         if ok:
             positive = True
-            if require_positive:
-                for j in range(p_new):
-                    if beta_new[j] <= 0.0:
-                        positive = False
-                        break
+            for j in range(p_new):
+                if beta_new[j] <= 0.0:
+                    positive = False
+                    break
             if positive:
                 q_new = int(np.sum(gamma_new))
                 log_post_new = _log_posterior(
@@ -337,15 +332,12 @@ def _predictive_pass(
     rising: npt.NDArray[np.float64],
     knots: npt.NDArray[np.float64],
     halve_idx: npt.NDArray[np.int64],
-    exponentiate: bool,
     store: bool,
-    offset: np.float64,
 ):
     """Posterior-predictive evaluation on the *unconvolved* bases.
 
     Walks the kept configurations with incremental design updates, transforms
-    each stored coefficient draw to the frequency grid (exponentiating per draw
-    in smooth mode so results are always linear-scale PSD), and accumulates
+    each stored coefficient draw to the frequency grid, and accumulates
     streaming mean/variance. When ``store`` the full draw matrix
     ``(n_kept * n_beta_draws, F)`` is also returned (empty otherwise).
     """
@@ -369,32 +361,14 @@ def _predictive_pass(
         p = design.shape[1]
         for d in range(n_beta_draws):
             curve = design @ betas[i, d, :p]
-            # Smooth mode fits log S(f). Accumulate on the LOG scale and
-            # exponentiate the mean (plug-in): exp(E[log S]) = S. The mean of
-            # exp(curve) would instead be S * exp(sigma^2/2), inflated upward by
-            # Jensen's inequality — the bias the log-mean offset unmasks.
             total += curve
             total_sq += curve * curve
             if store:
-                if exponentiate:
-                    # strip the sampling offset so predictive draws share the
-                    # PSD scale of `mean` (= their geometric mean, exp of E[log])
-                    stored[i * n_beta_draws + d] = np.exp(curve - offset)
-                else:
-                    stored[i * n_beta_draws + d] = curve
+                stored[i * n_beta_draws + d] = curve
 
-    mu = total / n_draws_total
-    var = total_sq / n_draws_total - mu * mu
-    if exponentiate:
-        # exp of the log-scale posterior mean; map the log-scale variance to a
-        # linear-scale sd via the lognormal relation sd = mean * sqrt(e^var - 1).
-
-        # Take offset off mean - Undoing the correction
-        mean = np.exp(mu - offset)
-        std = mean * np.sqrt(np.maximum(np.exp(var) - 1.0, 0.0))
-    else:
-        mean = mu
-        std = np.sqrt(np.maximum(var, 0.0)) # No negatives
+    mean = total / n_draws_total
+    var = total_sq / n_draws_total - mean * mean
+    std = np.sqrt(np.maximum(var, 0.0))  # No negatives
     return mean, std, stored
 
 
@@ -404,22 +378,16 @@ def _predictive_pass(
 
 @dataclass
 class FitResult:
-    """Posterior summary of a PSDebias fit. ``mean``/``std``/``posterior_predictive``
-    are always linear-scale PSD.
+    """Posterior summary of a PSDebias fit.
 
-    In debias mode ``mean`` is the posterior mean of the (linear) spectrum. In
-    smooth mode the fit is on ``log S(f)``, and ``mean`` is the exponentiated
-    posterior mean of that log-spectrum — ``exp(E[log S])``, the plug-in point
-    estimate (a geometric mean/median), not the posterior mean of ``S`` itself.
-    Taking the arithmetic mean of the exponentiated draws would instead give
-    ``S * exp(sigma^2/2)``, inflated upward by Jensen's inequality. ``std`` is
-    the matching linear-scale sd (lognormal-mapped in smooth mode), and
-    ``posterior_predictive`` still holds the individual exponentiated draws."""
+    ``mean`` is the posterior mean of the (linear-scale) debiased spectrum,
+    ``std`` its pointwise posterior standard deviation, and
+    ``posterior_predictive`` the individual draws behind them.
+    """
 
     freqs: npt.NDArray[np.float64]
     mean: npt.NDArray[np.float64]
     std: npt.NDArray[np.float64]
-    mode: str
     expected_knots: float
     acceptance_rate: float
     gammas: npt.NDArray[np.int8]
@@ -429,7 +397,7 @@ class FitResult:
 
 
 class PSDebias:
-    """Adaptive smoothing/debiasing of a quadratic spectral estimate.
+    """Adaptive debiasing of a quadratic spectral estimate.
 
     Parameters
     ----------
@@ -437,8 +405,6 @@ class PSDebias:
     freqs : normalized frequency grid in (0, 0.5) — the endpoint-dropped rfft
         grid of an ``n_time``-point segment. Work in normalized frequency
         (``fs = 1``); rescale externally for physical units.
-    mode : ``"debias"`` (bias-dominant regime, needs ``kernel`` and ``n_time``)
-        or ``"smooth"`` (variance-dominant regime).
     kernel : one-sided bias sequence ``h[tau]`` of the estimator (returned by
         every ``psdebias.estimators`` function), length ``n_time``.
     n_time : segment length whose rfft grid ``freqs`` lives on.
@@ -452,16 +418,12 @@ class PSDebias:
         estimate: npt.NDArray[np.float64],
         freqs: npt.NDArray[np.float64],
         *,
-        mode: str,
-        kernel: npt.NDArray[np.float64] | None = None,
-        dof: np.float64 | None = None, # Need dof for log scale correction
-        n_time: int | None = None,
+        kernel: npt.NDArray[np.float64],
+        n_time: int,
         knot_spacing: int = 4,
         log_knots: bool = False,
         rng: np.random.Generator | None = None,
     ) -> None:
-        if mode not in ("debias", "smooth"):
-            raise ValueError(f"mode must be 'debias' or 'smooth', got {mode!r}")
         estimate = np.asarray(estimate, dtype=np.float64)
         freqs = np.asarray(freqs, dtype=np.float64)
         if len(estimate) != len(freqs):
@@ -473,58 +435,26 @@ class PSDebias:
                 "freqs must lie strictly inside (0, 0.5): pass the endpoint-dropped "
                 "rfft grid in normalized frequency (fs = 1)"
             )
-        self.dof = dof
-        self.mode = mode
         self.freqs = freqs
         self.estimate = estimate
-        self.V =
         self.rng = np.random.default_rng() if rng is None else rng
 
-        # One kernel, two regressions. Everything mode-specific is decided
-        # right here and handed to the same _mh_kernel:
-        #
-        #                       debias                     smooth
-        #   knots            [0, freqs[pos], 0.5]       freqs[pos]
-        #   response Y       ones(g)                    log(estimate)
-        #   fitting bases    window-convolved x (1/I)   direct evaluations
-        #   halve (fit)      none (smooth PSD curves)   interior candidates
-        #   positivity       required on beta_hat       not needed (exp > 0)
-        #   output bases     unconvolved                unconvolved
-        #   output transform none                       exp per draw
-        #
-        # Debias: the paper's Eq. 5 regression I(w) ~ sum beta_i (B_i * H_n)(w)
-        # is divided through by I(w) — response becomes the constant 1 and the
+        # The paper's Eq. 5 regression I(w) ~ sum beta_i (B_i * H_n)(w) is
+        # divided through by I(w) — the response becomes the constant 1 and the
         # 1/I weighting rides on the bases. That stabilizes the variance
         # (periodogram-type estimates have sd proportional to their mean) while
-        # keeping the linear scale that links the spectrum to the ACVS.
-        # Smooth: log I(w) has approximately constant variance already, so the
-        # regression is ordinary least squares on plain B1 hats.
-        if mode == "debias":
-            if kernel is None or n_time is None:
-                raise ValueError("mode='debias' requires kernel and n_time")
-            kernel = np.asarray(kernel, dtype=np.float64)
-            self.knots, self._interior_idx, self._halve_out = splines.knot_grid(
-                freqs, knot_spacing, log_knots=log_knots, ghost_knots=True
-            )
-            weights = estimate**-1
-            falling_b, rising_b = splines.half_bases_biased(freqs, self.knots, n_time, kernel)
-            self._falling_fit = falling_b * weights[None, :]
-            self._rising_fit = rising_b * weights[None, :]
-            self._halve_fit = splines.EMPTY_IDX
-            self.response = np.ones(len(estimate))
-            self._require_positive = True
-        else:
-            self.knots, self._interior_idx, self._halve_out = splines.knot_grid(
-                freqs, knot_spacing, log_knots=log_knots, ghost_knots=False
-            )
-            self._falling_fit, self._rising_fit = splines.half_bases(freqs, self.knots)
-            self._halve_fit = self._halve_out
-            # Add in Correction (Need dof):
-            if self.dof is None:
-                raise ValueError("DOF required for smoothing")
-            offset = np.log(self.dof) - digamma(self.dof)
-            self.response = np.log(estimate) + offset
-            self._require_positive = False
+        # keeping the linear scale that links the spectrum to the ACVS. The
+        # chain is fitted on the window-convolved bases and read out on the
+        # unconvolved ones, which is what inverts the blurring.
+        kernel = np.asarray(kernel, dtype=np.float64)
+        self.knots, self._halve_out = splines.knot_grid(
+            freqs, knot_spacing, log_knots=log_knots
+        )
+        weights = estimate**-1
+        falling_b, rising_b = splines.half_bases_biased(freqs, self.knots, n_time, kernel)
+        self._falling_fit = falling_b * weights[None, :]
+        self._rising_fit = rising_b * weights[None, :]
+        self.response = np.ones(len(estimate))
 
         self._falling_out, self._rising_out = splines.half_bases(freqs, self.knots)
         self.n_interior = len(self.knots) - 2
@@ -538,13 +468,13 @@ class PSDebias:
         ``pi ~ Beta(a_pi, b_pi)``, ``gamma_i ~ Bernoulli(pi)``, resampling both
         each attempt.
 
-        In debias mode the chain's target is truncated to configurations with
-        all-positive least-squares coefficients, so the initial state must
-        satisfy that too — otherwise the sampler can start outside its own
-        support and freeze (every proposal from a dense negative-coefficient
-        state gets rejected). Attempts are retried until the unconstrained WLS
-        fit is all-positive; typically a handful suffice because small ``pi``
-        draws produce sparse, wide-hat configurations.
+        The chain's target is truncated to configurations with all-positive
+        least-squares coefficients, so the initial state must satisfy that too
+        — otherwise the sampler can start outside its own support and freeze
+        (every proposal from a dense negative-coefficient state gets rejected).
+        Attempts are retried until the unconstrained WLS fit is all-positive;
+        typically a handful suffice because small ``pi`` draws produce sparse,
+        wide-hat configurations.
         """
         yty = float(self.response @ self.response)
         for _ in range(max_attempts):
@@ -552,7 +482,7 @@ class PSDebias:
             gamma = (self.rng.uniform(size=self.n_interior) < pi0).astype(np.int8)
 
             design = splines.assemble_design(
-                self._falling_fit, self._rising_fit, gamma, self.knots, self._halve_fit
+                self._falling_fit, self._rising_fit, gamma, self.knots, splines.EMPTY_IDX
             )
             p = design.shape[1]
             beta = np.empty(p)
@@ -562,7 +492,7 @@ class PSDebias:
 
             if not ok:
                 continue
-            if not self._require_positive or np.all(beta > 0):
+            if np.all(beta > 0):
                 return gamma
 
         raise ValueError(
@@ -592,8 +522,8 @@ class PSDebias:
         frequency bins) is the default. ``a_pi``/``b_pi`` parameterize the
         Beta-Binomial prior on the number of active knots (1, 1 = uniform).
         ``initial_gamma`` overrides the default prior-sampled starting
-        configuration (in debias mode, supply one whose weighted least-squares
-        coefficients are positive, or the chain may never move).
+        configuration (supply one whose weighted least-squares coefficients are
+        positive, or the chain may never move).
         """
         if c is None:
             c = float(len(self.response))
@@ -624,7 +554,7 @@ class PSDebias:
             self._falling_fit,
             self._rising_fit,
             self.knots,
-            self._halve_fit,
+            splines.EMPTY_IDX,
             log_u,
             flip_idx,
             flip_val,
@@ -638,7 +568,6 @@ class PSDebias:
             warmup,
             n_iterations,
             thin,
-            self._require_positive,
         )
 
         if n_accept == 0:
@@ -649,7 +578,6 @@ class PSDebias:
                 stacklevel=2,
             )
 
-        offset = (np.log(self.dof) - digamma(self.dof)) if self.mode == "smooth" else 0.0
         mean, std, stored = _predictive_pass(
             gammas,
             betas,
@@ -657,9 +585,7 @@ class PSDebias:
             self._rising_out,
             self.knots,
             self._halve_out,
-            self.mode == "smooth",
             store_predictive,
-            offset=offset
         )
 
         self._hyper = {"a_pi": a_pi, "b_pi": b_pi, "c": float(c),
@@ -668,7 +594,6 @@ class PSDebias:
             freqs=self.freqs,
             mean=mean,
             std=std,
-            mode=self.mode,
             expected_knots=float(np.mean(np.sum(gammas, axis=1))),
             acceptance_rate=n_accept / n_total,
             gammas=gammas,
@@ -685,7 +610,7 @@ class PSDebias:
         posterior the chain targets (the original package used two different
         formulas for sampling and mode selection). The returned curve averages
         the stored coefficient draws of the winning configuration on the
-        unconvolved bases (exponentiated per draw in smooth mode).
+        unconvolved bases.
         """
         if self.result is None:
             raise RuntimeError("call sample() first")
@@ -714,20 +639,16 @@ class PSDebias:
         )
         p = design.shape[1]
         curves = self.result.betas[best, :, :p] @ design.T
-        if self.mode == "smooth":
-            # Taking away offset
-            offset = np.log(self.dof) - digamma(self.dof)
-            curves = np.exp(curves - offset)
         return gamma_map, curves.mean(axis=0)
 
     def design_matrix(self, gamma: npt.NDArray[np.int8], *, biased: bool) -> npt.NDArray[np.float64]:
         """Design matrix for a given configuration (debugging/diagnostics).
-        ``biased=True`` returns the fitting bases (weighted, window-convolved in
-        debias mode); ``biased=False`` the unconvolved output bases."""
+        ``biased=True`` returns the fitting bases (weighted, window-convolved);
+        ``biased=False`` the unconvolved output bases."""
         gamma = np.ascontiguousarray(gamma, dtype=np.int8)
         if biased:
             return splines.assemble_design(
-                self._falling_fit, self._rising_fit, gamma, self.knots, self._halve_fit
+                self._falling_fit, self._rising_fit, gamma, self.knots, splines.EMPTY_IDX
             )
         return splines.assemble_design(
             self._falling_out, self._rising_out, gamma, self.knots, self._halve_out
@@ -737,24 +658,15 @@ class PSDebias:
 def fit_psd(
     estimate: SpectralEstimate,
     *,
-    n_time: int | None = None,
-    mode: str = "debias",
+    n_time: int,
     knot_spacing: int = 4,
     log_knots: bool = False,
     rng: np.random.Generator | None = None,
     **sample_kwargs,
 ) -> FitResult:
-    """One-call PSDebias: build the sampler, sample, return the fit.
-
-    ``mode`` is ``"debias"`` or ``"smooth"``. Requires ``kernel`` and
-    ``n_time`` unless ``mode="smooth"``.
-    """
-
-    # take out items
-    freqs, psd, kernel, dof = estimate.freqs, estimate.psd, estimate.kernel, estimate.dof
-
+    """One-call PSDebias: build the sampler, sample, return the fit."""
     sampler = PSDebias(
-        psd, freqs, mode=mode, kernel=kernel,dof=dof, n_time=n_time,
+        estimate.psd, estimate.freqs, kernel=estimate.kernel, n_time=n_time,
         knot_spacing=knot_spacing, log_knots=log_knots, rng=rng,
     )
     return sampler.sample(**sample_kwargs)
