@@ -1,4 +1,4 @@
-# psdebias — Adaptive Debiasing of Quadratic Spectral Estimators
+# PSDebias — Adaptive Debiasing of Quadratic Spectral Estimators
 
 `psdebias` implements **PSDebias** (Dyson, Astfalck, Cripps & Stemler,
 *"Adaptive Smoothing of Quadratic Spectral Estimators"*): a Bayesian adaptive
