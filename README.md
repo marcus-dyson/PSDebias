@@ -12,12 +12,6 @@ with the estimator's known spectral window, the regression inverts the
 blurring, and evaluating the unconvolved bases at the fitted coefficients
 recovers the underlying spectrum.
 
-This package is a ground-up rewrite of the original `auto-speccy` research
-code with corrected statistics, stabilized numerics, ~65x lower sampler
-memory, and a full test suite. **See [CHANGES.md](docs/CHANGES.md) for every
-difference against the original, and [HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md)
-for a guided tour of how the implementation works.**
-
 ## Installation
 
 ```console
