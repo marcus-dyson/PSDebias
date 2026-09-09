@@ -7,7 +7,7 @@ spectral-window-convolved bases.
 """
 
 from psdebias.analytic import ar_spectrum, matern_acf, matern_spectrum
-from psdebias.dwelch import dquad
+from psdebias.dquad import dquad
 from psdebias.estimators import (
     SpectralEstimate,
     lag_window,

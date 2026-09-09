@@ -7,10 +7,10 @@ periodogram, Welch, multitaper and lag-window — in which the number, location
 and width of B1-spline bases are learned from the data by Metropolis-Hastings
 over a latent binary knot vector.
 
-Bias-dominant estimates are *debiased* on the linear scale: the spline bases
-are convolved with the estimator's known spectral window, the regression
-inverts the blurring, and evaluating the unconvolved bases at the fitted
-coefficients recovers the underlying spectrum.
+Estimates are debiased on the linear scale: the spline bases are convolved
+with the estimator's known spectral window, the regression inverts the
+blurring, and evaluating the unconvolved bases at the fitted coefficients
+recovers the underlying spectrum.
 
 This package is a ground-up rewrite of the original `auto-speccy` research
 code with corrected statistics, stabilized numerics, ~65x lower sampler
@@ -73,21 +73,20 @@ gamma = np.zeros(len(est.freqs), dtype=np.int8)
 gamma[::10] = 1                                   # a uniform mesh
 debiased = dquad(est.psd, est.freqs, gamma=gamma, kernel=est.kernel,
                  n_time=1024)
-
-# ...or account for the correlation between neighbouring bins (DQuad Eq. 12).
-# A no-op for rectangular tapers, where the bins are exactly uncorrelated.
-debiased = dquad(est.psd, est.freqs, gamma=gamma, kernel=est.kernel,
-                 n_time=1024, corr=est.corr)
 ```
+
+`dquad` also accepts the full one-sided grid (`drop_endpoints=False`), where
+`freqs[0] = 0` and `freqs[-1] = 1/2` are themselves the ghost knots and `gamma`
+runs over the interior candidates `freqs[1:-1]`.
 
 ## API
 
 | symbol | purpose |
 |---|---|
-| `periodogram, welch, lag_window, multitaper` | classical estimators; each returns `SpectralEstimate(freqs, psd, kernel, corr)` where `kernel` is the one-sided bias sequence `h[tau]` the debiasing machinery needs and `corr` the one-sided frequency-correlation sequence `rho[d]` (`.corr_matrix()` for the dense form) |
+| `periodogram, welch, lag_window, multitaper` | classical estimators; each returns `SpectralEstimate(freqs, psd, kernel)`, where `kernel` is the one-sided bias sequence `h[tau]` the debiasing machinery needs |
 | `fit_psd` | sampling + posterior summary in one call |
 | `PSDebias` | the sampler class (`sample`, `map_estimate`, `design_matrix`) |
-| `dquad` | fixed-knot debiasing on B0 bases, arbitrary nonuniform knots (the DWelch/DQuad baseline); pass `corr=` for the generalised least squares of DQuad Eq. 12 |
+| `dquad` | fixed-knot debiasing on B0 bases, arbitrary nonuniform knots (the DWelch/DQuad baseline) |
 | `ar_spectrum, matern_acf, matern_spectrum` | closed-form validation targets |
 | `sample_ar, sample_matern` | seeded process simulators (AR via `lfilter`, Matern via circulant embedding) |
 
@@ -124,6 +123,10 @@ The paper's bias-variance study lives outside the library
   `--n-samples/--n-iterations/--warmup` shrink it for smoke runs.
 * `notebooks/bias-variance.ipynb` — empirical MSE/bias/variance comparison of
   all streams against the closed-form spectra.
+* `notebooks/fig_gen.ipynb` — regenerates the paper's method figures (AR(4)
+  debiasing against the uniform-mesh baselines, sunspot application) into
+  `figs/paper/`.
+* `notebooks/demo.ipynb` — a short walk through the API on one realisation.
 
 ## Testing
 
