@@ -21,8 +21,7 @@ for a guided tour of how the implementation works.**
 ## Installation
 
 ```console
-pip install -e '.[test]'      # from this directory; Python >= 3.10
-pytest                        # fast tests; `pytest -m ""` adds slow end-to-end runs
+pip install -e .   # from this directory; Python >= 3.10
 ```
 
 Dependencies: `numpy`, `scipy`, `numba`.
@@ -127,21 +126,6 @@ The paper's bias-variance study lives outside the library
   debiasing against the uniform-mesh baselines, sunspot application) into
   `figs/paper/`.
 * `notebooks/demo.ipynb` — a short walk through the API on one realisation.
-
-## Testing
-
-```console
-pytest            # unit tests (~2 s)
-pytest -m ""      # + slow end-to-end AR(4)/Matern studies (~5 min)
-```
-
-Highlights: bit-for-bit equality of incremental vs full design assembly over
-random MCMC-like walks; closed-form basis ACFs vs adaptive quadrature; biased
-bases vs dense numerical convolution with the spectral window; the JIT
-posterior vs an independent scipy reference; conditional-draw moments vs the
-analytic Student-t posterior; B1 partition of unity; determinism under a fixed
-seed; and end-to-end mean-square-error improvement over the raw estimators on
-analytic spectra.
 
 ## License
 
