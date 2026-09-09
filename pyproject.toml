@@ -27,14 +27,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=7", "pytest-cov"]
-# For scripts/ and notebooks/ (the bias-variance study), not the library.
 scripts = ["tqdm", "matplotlib", "scienceplots"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/psdebias"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-markers = ["slow: long-running end-to-end MCMC tests (deselect with '-m \"not slow\"')"]
-addopts = "-m 'not slow'"
